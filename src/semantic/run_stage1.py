@@ -22,6 +22,7 @@ from src.stage1.rae import RAE
 from torchvision.utils import save_image
 from src.semantic.segmentation import get_text_guided_coords, extract_semantic_mask_with_clipseg
 from src.semantic.utils import cleanup_memory, load_and_transform, _calculate_dynamic_coords
+from src.semantic.resize import apply_m1_scaling, adaptive_target_size, apply_m2_latent_scaling
 from src.semantic.modelManager import ModelManager
 from src.semantic.config import DEVICE, DTYPE, DTYPE_MODERN
 
@@ -35,31 +36,16 @@ dtype = DTYPE
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 t_size = 448
-
-# --- [NEW TOOL]: Color Matching (From your proposed solution) ---
-def match_mean_std(src, ref):
-    """
-    Adjusts the statistics of the src tensor to match the ref tensor.
-    Helps the object blend into the lighting of the background.
-    """
-    # src, ref: [B, C, H, W]
-    src_mean = src.mean([2, 3], keepdim=True)
-    src_std  = src.std([2, 3], keepdim=True)
-    ref_mean = ref.mean([2, 3], keepdim=True)
-    ref_std  = ref.std([2, 3], keepdim=True)
-    return (src - src_mean) / (src_std + 1e-6) * ref_std + ref_mean
-
 def get_cropped_object_tensor(
         raw_image: Image.Image,
         target_text: str,
-        scale_factor: float = 1.0,
-        background_mode: str = "black", 
-        target_size_for_encoder: int = 448
+        scale_factor: float = 1.2,
+        background_mode: str = "mean",
+        target_size_for_encoder: int = 224
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
     W_orig, H_orig = raw_image.size
 
-    # 1. Mask Generation
+    # Generate Mask via CLIPSeg
     mask = extract_semantic_mask_with_clipseg(
         image=raw_image,
         target_text=target_text,
@@ -67,62 +53,34 @@ def get_cropped_object_tensor(
         threshold=0.3
     ).cpu().squeeze()
 
-    # [STRATEGY]: Keep Hard Mask in Pixel Space.
-    # Do NOT blur here, or the green background will bleed into the rabbit.
-    binary_mask_np = (mask.numpy() > 0.3).astype(np.uint8)
+    binary_mask = (mask.numpy() > 0.3).astype(np.uint8)
+    rows, cols = np.any(binary_mask, axis=1), np.any(binary_mask, axis=0)
 
-    rows, cols = np.any(binary_mask_np, axis=1), np.any(binary_mask_np, axis=0)
-
-    # 2. Crop
     if not np.any(rows) or not np.any(cols):
         print(f"[Warning] No object '{target_text}' found. Using full image.")
-        obj_crop = raw_image
-        mask_crop = Image.new("L", (W_orig, H_orig), 255)
+        obj_to_scale = raw_image
+        mask_to_scale = Image.new("L", (t_size, t_size), 255)
     else:
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
-        buffer = 5
-        rmin = max(0, rmin - buffer)
-        rmax = min(H_orig, rmax + buffer)
-        cmin = max(0, cmin - buffer)
-        cmax = min(W_orig, cmax + buffer)
+        # Tight crop of the object
+        obj_to_scale = Image.fromarray(np.array(raw_image)[rmin:rmax, cmin:cmax])
+        mask_to_scale = Image.fromarray((binary_mask[rmin:rmax, cmin:cmax] * 255).astype(np.uint8), mode='L')
 
-        obj_crop = Image.fromarray(np.array(raw_image)[rmin:rmax, cmin:cmax])
-        mask_crop = Image.fromarray((binary_mask_np[rmin:rmax, cmin:cmax] * 255).astype(np.uint8), mode='L')
+    # Apply M1 Scaling to both object and mask
+    final_obj_pil = apply_m1_scaling(obj_to_scale, scale_factor, target_size_for_encoder, background_mode)
 
-    # 3. Scale
-    w_crop, h_crop = obj_crop.size
-    max_dim = max(w_crop, h_crop)
-    target_inner_size = int(target_size_for_encoder * scale_factor)
-    resize_ratio = target_inner_size / max_dim
-    new_w = int(w_crop * resize_ratio)
-    new_h = int(h_crop * resize_ratio)
+    # For mask, we use black background (0) regardless of mode
+    final_mask_pil = apply_m1_scaling(mask_to_scale, scale_factor, target_size_for_encoder, background_mode="black")
 
-    obj_resized = obj_crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    # Use NEAREST to maintain the "Clean Cut"
-    mask_resized = mask_crop.resize((new_w, new_h), Image.Resampling.NEAREST)
-
-    # 4. Paste on Black
-    final_obj_pil = Image.new("RGB", (target_size_for_encoder, target_size_for_encoder), (0, 0, 0))
-    final_mask_pil = Image.new("L", (target_size_for_encoder, target_size_for_encoder), 0)
-
-    paste_x = (target_size_for_encoder - new_w) // 2
-    paste_y = (target_size_for_encoder - new_h) // 2
-
-    final_obj_pil.paste(obj_resized, (paste_x, paste_y), mask_resized)
-    final_mask_pil.paste(mask_resized, (paste_x, paste_y))
-
-    # 5. Tensor
+    # Convert to Tensors
     obj_tensor = T.ToTensor()(final_obj_pil).unsqueeze(0).to(device, dtype=dtype)
     mask_tensor = T.ToTensor()(final_mask_pil).unsqueeze(0).to(device, dtype=dtype)
-    
-    # Binarize strict
-    mask_tensor = (mask_tensor > 0.5).float()
 
     if mask_tensor.shape[1] > 1:
         mask_tensor = mask_tensor[:, 0:1, :, :]
 
-    return obj_tensor, mask_tensor
+    return obj_tensor, (mask_tensor > 0).float()
 
 
 def semantic_fusion(
@@ -138,29 +96,25 @@ def semantic_fusion(
 ) -> torch.Tensor:
     B, C, H, W = base_latent.shape
     
-    # [OPTIONAL]: Adjusted base_unit size from your suggestion (0.35)
-    # If the user feels the rabbit is too big, this helps.
-    if location_prompt and "foreground" in location_prompt:
-        base_unit = min(H, W) * 0.4 
-    else:
-        base_unit = min(H, W) * 0.6
-
+    # Decoupled scaling: 1.0 means the object occupies 60% of background's short side
+    base_unit = min(H, W) * 0.6
     target_size = max(min_size, int(base_unit * scale_factor))
     target_size = min(target_size, min(H, W) - 2)
 
-    # Use Bilinear for Latent Mask (This provides the softness safely)
+    # Use bilinear for Soft-Mask to get smooth edges
     mask_latent = F.interpolate(object_mask, size=(H, W), mode="bilinear", align_corners=False)
     
-    if mask_latent.max() < 0.1: return base_latent
-
-    mask_np = (mask_latent[0, 0] > 0.5).cpu().numpy()
+    # Find the bounding box in latent space
+    mask_np = (mask_latent[0, 0] > 0.3).cpu().numpy()
     ys, xs = np.where(mask_np)
-    if len(xs) == 0: return base_latent
+    if len(xs) == 0: 
+        return base_latent
 
     y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
     obj_crop = object_latent[:, :, y0:y1 + 1, x0:x1 + 1]
     mask_crop = mask_latent[:, :, y0:y1 + 1, x0:x1 + 1]
 
+    # Calculate scale for latent patches
     h0, w0 = obj_crop.shape[2:]
     scale = target_size / max(h0, w0)
     h1, w1 = max(1, int(h0 * scale)), max(1, int(w0 * scale))
@@ -168,6 +122,7 @@ def semantic_fusion(
     obj_rs = F.interpolate(obj_crop, (h1, w1), mode="bicubic")
     mask_rs = F.interpolate(mask_crop, (h1, w1), mode="bilinear", align_corners=False)
 
+    # Determine coordinates
     effective_smart = False
     if use_smart_placement and location_prompt and raw_base_image:
         coords = get_text_guided_coords(raw_base_image, location_prompt, h1, w1, (H, W))
@@ -178,18 +133,15 @@ def semantic_fusion(
     if not effective_smart:
         ts_h, te_h, ts_w, te_w = _calculate_dynamic_coords(H, W, h1, w1, target_area)
 
+    # Execute Soft-Fusion (Alpha Blending)
     fused = base_latent.clone()
     base_patch = base_latent[:, :, ts_h:te_h, ts_w:te_w]
     
-    if obj_rs.shape[2:] != base_patch.shape[2:]:
-        obj_rs = F.interpolate(obj_rs, base_patch.shape[2:], mode="bicubic")
-        mask_rs = F.interpolate(mask_rs, base_patch.shape[2:], mode="bilinear")
+    # Ensure dimensions match perfectly
+    obj_rs = F.interpolate(obj_rs, base_patch.shape[2:], mode="bicubic")
+    mask_rs = F.interpolate(mask_rs, base_patch.shape[2:], mode="bilinear", align_corners=False)
 
-    # [KEY LOGIC]: Contrast Stretching
-    # Safe Softness. Removes low-confidence background, keeps high-confidence rabbit solid.
-    # Gamma 1.5 helps darken the semi-transparent edges (anti-halo).
-    mask_rs = torch.clamp((mask_rs - 0.2) * 2.0, 0, 1) ** 1.5
-
+    # Smooth blending reduces edge artifacts
     fused[:, :, ts_h:te_h, ts_w:te_w] = (
         mask_rs * obj_rs + (1.0 - mask_rs) * base_patch
     )
@@ -200,26 +152,23 @@ def semantic_fusion(
 def stage1_extract_features(rae, base_img_tensor, base_pil_image, replace_pil_image, 
                            scale_factor, target_area, target_text, output_path,
                            location_prompt=None, use_smart_placement=True):
-    
+    # M1 Phase: Extract high-quality features at fixed scale (1.0)
     object_tensor, object_mask = get_cropped_object_tensor(
         raw_image=replace_pil_image,
         target_text=target_text,
-        scale_factor=scale_factor,
-        target_size_for_encoder=t_size,
-        background_mode="black" 
+        scale_factor=1.0, 
+        target_size_for_encoder=t_size
     )
-    
     object_tensor = object_tensor.to(device, dtype=DTYPE_MODERN)
     object_mask = object_mask.to(device, dtype=DTYPE_MODERN)
 
-    # [INTEGRATION]: Apply Color Matching Here!
-    # This aligns the rabbit's color stats with the background scene.
-    object_tensor = match_mean_std(object_tensor, base_img_tensor)
+    save_image(object_tensor.float(), os.path.join(output_path, f"crop_obj_{timestamp}.png"))
 
     with torch.amp.autocast('cuda', dtype=DTYPE_MODERN):
         base_latent = rae.encode(base_img_tensor)
         object_latent = rae.encode(object_tensor)
 
+        # M2 Phase: Apply final scale_factor only in Latent Space
         fused_latent_2d = semantic_fusion(
             base_latent,
             object_latent,
@@ -227,13 +176,14 @@ def stage1_extract_features(rae, base_img_tensor, base_pil_image, replace_pil_im
             raw_base_image=base_pil_image,
             location_prompt=location_prompt,
             target_area=target_area,
-            scale_factor=1.0,
+            scale_factor=scale_factor,
             min_size=8,
             use_smart_placement=use_smart_placement
         )
         
         fused_features_seq = fused_latent_2d.flatten(2).transpose(1, 2).contiguous()
         
+        # Save preview
         check_img = rae.decode(fused_latent_2d)
         os.makedirs(os.path.join(output_path), exist_ok=True)
         save_path = os.path.join(output_path, f"fusion_check_{timestamp}.png")
@@ -263,7 +213,11 @@ def stage1(base_image_path, replace_image_path, output_path, target_area, target
         use_smart_placement=True
     )
 
-    print(f"Intermediate fusion check saved to: {output_path}")
+    with torch.no_grad():
+        intermediate_img = rae.decode(fused_features_2d)
+        check_path = os.path.join(output_path, f"fusion_check_stage1_{timestamp}.png")
+        save_image(intermediate_img, check_path)
+        print(f"Intermediate fusion check saved to: {check_path}")
 
     torch.save({
         'fused_features': fused_features_2d.cpu(),
@@ -273,21 +227,71 @@ def stage1(base_image_path, replace_image_path, output_path, target_area, target
         'replace_image': replace_image_path
     }, fused_path)
 
+    print(f"Saved fused features to: {fused_path}")
+
     del rae
     cleanup_memory()
 
 
 if __name__ == "__main__":
+    # base_image_path = "assets/group2/base1.png"
+    # replace_image_path = "assets/group2/r2.png"
+    # output_path = "assets/group2/stage1_result"
+    # target_area = "center"
+    # target_text = "orange"
+    # location_prompt = "on the table"
+
+    # base_image_path = "assets/group1/base.png"
+    # replace_image_path = "assets/group1/r.png"
+    # output_path = "assets/group1/stage1_result/"
+    # target_area = "bottom_right"
+    # target_text = "dog"
+    # scale_factor = 1.0
+    # location_prompt = "grass central"
+
+    # base_image_path = "assets/group3/base.png"
+    # replace_image_path = "assets/group3/r1.png"
+    # output_path = "assets/group3/stage1_result/"
+    # target_area = "top_right"
+    # target_text = "eagel"
+    # scale_factor = 1.0
+    # location_prompt = "sky central"
+
+    # base_image_path = "assets/group4/base.png"
+    # replace_image_path = "assets/group4/r.png"
+    # output_path = "assets/group4/stage1_result/"
+    # target_area = "top_right"
+    # target_text = "butterfly"
+    # scale_factor = 1.0
+    # location_prompt = "on flowers"
+
     base_image_path = "assets/group5/base.png"
-    replace_image_path = "assets/group5/r2.png"
+    replace_image_path = "assets/group5/r1.png"
     output_path = "assets/group5/stage1_result/"
     target_area = "bottom_right"
-    target_text = "rabbit"
-    scale_factor = 0.5 # Slightly Adjusted
-    location_prompt = "grass foreground"
+    target_text = "animal"
+    scale_factor = 1.0
+    location_prompt = "grass foreground central"
+
+    # base_image_path = "assets/group7/base.png"
+    # replace_image_path = "assets/group7/r1.png"
+    # output_path = "assets/group7/stage1_result/"
+    # target_area = "top_right"
+    # target_text = "fish"
+    # scale_factor = 1.0
+    # location_prompt = "central"
+
+    # base_image_path = "assets/group10/base1.png"
+    # replace_image_path = "assets/group10/r1.png"
+    # output_path = "assets/group10/stage1_result/"
+    # target_area = "top_right"
+    # target_text = "eagle"
+    # scale_factor = 1.0
+    # location_prompt = "top_right"
 
     os.makedirs(output_path, exist_ok=True)
     fused_path = os.path.join(output_path, "fused_results.pt")
+
 
     stage1(base_image_path, replace_image_path, output_path, target_area, target_text, fused_path, location_prompt=location_prompt,scale_factor=scale_factor)
     print("Stage 1 completed.\n")

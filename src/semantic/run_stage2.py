@@ -166,7 +166,7 @@ def stage2_optimized(output_path, fused_path):
         print(f"Success. Saved to {out_name}")
 
 if __name__ == "__main__":
-    out_dir = "assets/group3/"
+    out_dir = "assets/group7/"
     fused_file = os.path.join(out_dir, "stage1_result","fused_results.pt")
     print(f"Processing fused file at: {fused_file}")
     if os.path.exists(fused_file):

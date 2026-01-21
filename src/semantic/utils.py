@@ -14,6 +14,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 from src.semantic.config import DEVICE, DTYPE
+import random
 
 def cleanup_memory():
     gc.collect()
@@ -28,6 +29,7 @@ def load_and_transform(path: str, target_size: int = 224) -> torch.Tensor:
     tensor = T.ToTensor()(img).unsqueeze(0)
     tensor = tensor.to(device=DEVICE, dtype=DTYPE)
     return tensor
+
 
 def _calculate_dynamic_coords(H: int, W: int, h_new: int, w_new: int, area: str) -> Tuple[int, int, int, int]:
     """
