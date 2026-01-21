@@ -1,0 +1,28 @@
+[
+  {
+    "path": "assets/group4/r.png",
+    "text": "butterfly",
+    "target_area": "bottom_left",
+    "location_prompt": "on the flower",
+    "base_scale": 0.8,
+    "use_smart": true,
+    "z_order": 0,
+
+    "num_candidates": 16,
+    "jitter": 0.18,
+    "lambda_overlap": 0.4
+  },
+  {
+    "path": "assets/group4/r2.png",
+    "text": "butterfly",
+    "target_area": "bottom_right",
+    "location_prompt": "on the outer petals of the flower",
+    "base_scale": 0.8,
+    "use_smart": true,
+    "z_order": 1,
+
+    "num_candidates": 16,
+    "jitter": 0.18,
+    "lambda_overlap": 0.6
+  }
+]
