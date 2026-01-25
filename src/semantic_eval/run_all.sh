@@ -105,3 +105,6 @@ echo "train: assets/out_ctrl/train/adapter/{canny|depth|both}/"
 echo "infer: assets/out_ctrl/infer/{canny|depth|both}/{img2img|txt2img}/"
 echo "logs : assets/out_ctrl/logs/"
 echo "=============================="
+
+
+
