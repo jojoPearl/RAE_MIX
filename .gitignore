@@ -18,3 +18,15 @@ upload_to_hf.py
 /ckpts/
 data
 models
+
+# ignore everything under assets
+assets/**
+
+# allow assets directory
+!assets/
+
+# allow group4 directory
+!assets/group4/
+
+# allow ONLY this file
+!assets/group4/object.json
