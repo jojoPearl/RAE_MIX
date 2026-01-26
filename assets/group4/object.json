@@ -4,40 +4,33 @@
     "text": "butterfly",
     "target_area": "bottom_left",
     "location_prompt": "on the flower",
+    "base_scale": 0.8,
     "use_smart": true,
     "z_order": 0,
 
-    "m1_scale": 1.0,
-    "m2_scale": 0.8,
-
-    "clipseg_threshold": 0.3,
-    "background_mode": "mean",
-
-    "scene_prompt": "a photo of a flower",
-    "control_prompt": "a butterfly on the flower",
     "num_candidates": 16,
     "jitter": 0.18,
     "lambda_overlap": 0.4,
-    "candidate_scales": [0.7, 0.8, 0.9],
-    "alpha": 1.0
+
+    "use_adaptive_scale": false
   },
   {
     "path": "assets/group4/r2.png",
     "text": "butterfly",
     "target_area": "bottom_right",
-    "location_prompt": "on the outer petals",
+    "location_prompt": "on the outer petals of the flower",
+    "base_scale": 0.8,
     "use_smart": true,
     "z_order": 1,
 
-    "m1_scale": 1.0,
-    "m2_scale": 0.8,
-
-    "scene_prompt": "a photo of a flower",
-    "control_prompt": "a butterfly on the outer petals",
     "num_candidates": 16,
     "jitter": 0.18,
     "lambda_overlap": 0.6,
-    "candidate_scales": [0.7, 0.8, 0.9],
-    "alpha": 1.0
+
+    "use_adaptive_scale": true,
+    "gamma": 0.5,
+    "eta": 0.9,
+    "min_scale": 0.2,
+    "max_scale": 0.8
   }
 ]

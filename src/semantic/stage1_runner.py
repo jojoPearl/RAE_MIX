@@ -1,12 +1,14 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import os
 import sys
+import glob
 import json
-import datetime
 import argparse
-from typing import List, Tuple, Dict, Optional, Any
+import datetime
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import torch
@@ -14,14 +16,13 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.utils import save_image
-from transformers import CLIPModel, CLIPProcessor
 
 # -------------------- Path setup --------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
-# -------------------- Project imports --------------------
+# -------------------- Imports --------------------
 from src.semantic.segmentation import get_text_guided_coords, extract_semantic_mask_with_clipseg
 from src.semantic.utils import cleanup_memory, load_and_transform, _calculate_dynamic_coords
 from src.semantic.resize import apply_m1_scaling
@@ -32,20 +33,23 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 device = DEVICE
+t_size = 448
 
 
-# =========================================================================
-# CLIP Scorer (optional rerank)
-# =========================================================================
+# -------------------------------------------------------------------------
+# CLIP Scorer (optional)
+# -------------------------------------------------------------------------
 class CLIPScorerTF:
     def __init__(self, device: torch.device, model_id: str = "openai/clip-vit-base-patch32"):
+        from transformers import CLIPModel, CLIPProcessor
         self.device = device
         self.processor = CLIPProcessor.from_pretrained(model_id)
         self.model = CLIPModel.from_pretrained(model_id).to(device).eval()
+
         self._text_cache: Dict[str, torch.Tensor] = {}
 
         self._mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
-        self._std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        self._std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
 
     @torch.no_grad()
     def _encode_text_cached(self, texts: List[str]) -> torch.Tensor:
@@ -62,10 +66,17 @@ class CLIPScorerTF:
                 missing_idx.append(i)
 
         if missing:
-            tok = self.processor(text=missing, images=None, return_tensors="pt", padding=True, truncation=True)
+            tok = self.processor(
+                text=missing,
+                images=None,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            )
             tok = {k: v.to(self.device) for k, v in tok.items() if isinstance(v, torch.Tensor)}
             txt_feat = self.model.get_text_features(**tok)
             txt_feat = F.normalize(txt_feat, dim=-1)
+
             for j, t in enumerate(missing):
                 emb = txt_feat[j:j + 1]
                 self._text_cache[t] = emb
@@ -87,13 +98,18 @@ class CLIPScorerTF:
 
         img_feat = self.model.get_image_features(pixel_values=img)
         img_feat = F.normalize(img_feat, dim=-1)
+
         txt_feat = self._encode_text_cached(texts)
         return (img_feat * txt_feat).sum(dim=-1)
 
 
-# =========================================================================
+# -------------------------------------------------------------------------
 # Utils
-# =========================================================================
+# -------------------------------------------------------------------------
+def timestamp_str():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+
 def feather_mask(mask: torch.Tensor, iters: int = 2, k: int = 3) -> torch.Tensor:
     m = mask
     pad = k // 2
@@ -127,9 +143,13 @@ def safe_patch_slice(t: torch.Tensor, ts_h: int, te_h: int, ts_w: int, te_w: int
 
 
 def generate_candidate_coords(
-    H: int, W: int, ph: int, pw: int,
+    H: int,
+    W: int,
+    ph: int,
+    pw: int,
     base_coords: Tuple[int, int, int, int],
-    num: int = 12, jitter: float = 0.12
+    num: int = 12,
+    jitter: float = 0.12
 ) -> List[Tuple[int, int, int, int]]:
     ts_h, _, ts_w, _ = base_coords
     coords: List[Tuple[int, int, int, int]] = []
@@ -145,14 +165,44 @@ def generate_candidate_coords(
     return coords
 
 
-# =========================================================================
-# Object extraction (pixel space -> tensor + soft mask)
-# =========================================================================
+# -------------------------------------------------------------------------
+# Geometry: scale in latent canvas
+# -------------------------------------------------------------------------
+def scale_in_latent_canvas(
+    feat: torch.Tensor,
+    mask: torch.Tensor,
+    scale_factor: float,
+    padding_mode: str = "zeros"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, C, H, W = feat.shape
+    a = 1.0 / max(float(scale_factor), 1e-6)
+
+    mask = mask.to(device=feat.device, dtype=feat.dtype)
+
+    theta = torch.tensor(
+        [[[a, 0.0, 0.0],
+          [0.0, a, 0.0]]],
+        device=feat.device,
+        dtype=feat.dtype
+    ).repeat(B, 1, 1)
+
+    grid = F.affine_grid(theta, size=feat.size(), align_corners=False)
+    feat_s = F.grid_sample(feat, grid, mode="bilinear", padding_mode=padding_mode, align_corners=False)
+
+    grid_m = F.affine_grid(theta, size=mask.size(), align_corners=False).to(dtype=feat.dtype)
+    mask_s = F.grid_sample(mask, grid_m, mode="bilinear", padding_mode=padding_mode, align_corners=False)
+    return feat_s, mask_s.clamp(0, 1)
+
+
+# -------------------------------------------------------------------------
+# Crop object + mask in pixel space for encoder
+# -------------------------------------------------------------------------
 def get_cropped_object_tensor(
     raw_image: Image.Image,
     target_text: str,
-    target_size_for_encoder: int,
+    scale_factor: float = 1.0,
     background_mode: str = "mean",
+    target_size_for_encoder: int = 448,
     clipseg_threshold: float = 0.3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     W_orig, H_orig = raw_image.size
@@ -174,47 +224,60 @@ def get_cropped_object_tensor(
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
         obj_to_scale = Image.fromarray(np.array(raw_image)[rmin:rmax + 1, cmin:cmax + 1])
-        mask_to_scale = Image.fromarray((mask_soft[rmin:rmax + 1, cmin:cmax + 1] * 255.0).astype(np.uint8), mode="L")
+        mask_to_scale = Image.fromarray(
+            (mask_soft[rmin:rmax + 1, cmin:cmax + 1] * 255.0).astype(np.uint8),
+            mode="L"
+        )
 
-    # encoder 输入：始终用 M1=1.0（高质量）
-    final_obj_pil = apply_m1_scaling(obj_to_scale.convert("RGB"), 1.0, target_size_for_encoder, background_mode)
-    final_mask_pil = apply_m1_scaling(mask_to_scale.convert("RGB"), 1.0, target_size_for_encoder, background_mode="black").convert("L")
+    final_obj_pil = apply_m1_scaling(obj_to_scale.convert("RGB"), scale_factor, target_size_for_encoder, background_mode)
+    final_mask_pil = apply_m1_scaling(mask_to_scale.convert("RGB"), scale_factor, target_size_for_encoder, background_mode="black").convert("L")
 
     obj_t = T.ToTensor()(final_obj_pil).unsqueeze(0).to(device=device, dtype=DTYPE_MODERN)
     mask_t = T.ToTensor()(final_mask_pil).unsqueeze(0).to(device=device, dtype=torch.float32)
     return obj_t, mask_t[:, 0:1].clamp(0, 1)
 
 
-# =========================================================================
-# Fusion mode A: v2 (scale in latent canvas via affine_grid/grid_sample)
-# =========================================================================
-def scale_in_latent_canvas(
-    feat: torch.Tensor,
-    mask: torch.Tensor,
-    scale_factor: float,
-    padding_mode: str = "zeros",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, C, H, W = feat.shape
-    a = 1.0 / max(float(scale_factor), 1e-6)
+# -------------------------------------------------------------------------
+# Adaptive Scale (optional)
+# -------------------------------------------------------------------------
+def calculate_adaptive_scale(
+    base_pil_image: Image.Image,
+    location_prompt: str,
+    H: int,
+    W: int,
+    gamma: float = 0.5,
+    eta: float = 0.9,
+    min_scale: float = 0.2,
+    max_scale: float = 0.8
+) -> float:
+    if not location_prompt:
+        return 0.5
 
-    mask = mask.to(device=feat.device, dtype=feat.dtype)
+    heatmap = extract_semantic_mask_with_clipseg(
+        image=base_pil_image,
+        target_text=location_prompt,
+        feature_size=(H, W),
+        threshold=0.1
+    )
+    mask_binary = (heatmap > 0.1).float()
+    area_pixels = mask_binary.sum().item()
+    total_pixels = H * W
+    r = area_pixels / max(total_pixels, 1)
 
-    theta = torch.tensor(
-        [[[a, 0.0, 0.0],
-          [0.0, a, 0.0]]],
-        device=feat.device,
-        dtype=feat.dtype
-    ).repeat(B, 1, 1)
+    if r < 1e-5:
+        print(f"  [Adaptive] No active area for '{location_prompt}', default 0.5")
+        return 0.5
 
-    grid = F.affine_grid(theta, size=feat.size(), align_corners=False)
-    feat_s = F.grid_sample(feat, grid, mode="bilinear", padding_mode=padding_mode, align_corners=False)
-
-    grid_m = F.affine_grid(theta, size=mask.size(), align_corners=False)
-    grid_m = grid_m.to(dtype=feat.dtype)
-    mask_s = F.grid_sample(mask, grid_m, mode="bilinear", padding_mode=padding_mode, align_corners=False)
-    return feat_s, mask_s.clamp(0, 1)
+    rho = r ** gamma
+    suggested = rho * eta
+    final = max(min_scale, min(suggested, max_scale))
+    print(f"  [Adaptive] r={r:.4f} rho={rho:.4f} suggested={suggested:.4f} final={final:.4f}")
+    return final
 
 
+# -------------------------------------------------------------------------
+# Fusion
+# -------------------------------------------------------------------------
 @torch.no_grad()
 def semantic_fusion_v2(
     canvas_latent: torch.Tensor,
@@ -233,6 +296,7 @@ def semantic_fusion_v2(
     forced_coords: Optional[Tuple[int, int, int, int]] = None,
     alpha: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+
     B, C, H, W = canvas_latent.shape
 
     mask_l = F.interpolate(object_mask_img, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
@@ -255,10 +319,16 @@ def semantic_fusion_v2(
         if use_smart_placement and location_prompt and raw_base_image is not None:
             avoid = occupied_mask_latent if occupied_mask_latent is not None else None
             coords = get_text_guided_coords(
-                raw_base_image, location_prompt, ph, pw, (H, W),
-                avoid_mask=avoid, avoid_strength=float(10.0),
+                raw_base_image,
+                location_prompt,
+                ph,
+                pw,
+                (H, W),
+                avoid_mask=avoid,
+                avoid_strength=float(10.0),
                 avoid_thr=float(0.05),
             )
+
         if coords is None:
             ts_h, te_h, ts_w, te_w = _calculate_dynamic_coords(H, W, ph, pw, target_area)
         else:
@@ -269,7 +339,7 @@ def semantic_fusion_v2(
     base_p = safe_patch_slice(canvas_latent, ts_h, te_h, ts_w, te_w)
     if base_p.shape[-2:] != obj_p.shape[-2:]:
         obj_p = F.interpolate(obj_p, size=base_p.shape[-2:], mode="bilinear", align_corners=False)
-        m_p = F.interpolate(m_p, size=base_p.shape[-2:], mode="bilinear", align_corners=False)
+        m_p   = F.interpolate(m_p,   size=base_p.shape[-2:], mode="bilinear", align_corners=False)
 
     m_eff = (m_p * float(alpha)).clamp(0, 1)
 
@@ -289,158 +359,58 @@ def semantic_fusion_v2(
     return new_canvas, union_mask
 
 
-# =========================================================================
-# Fusion mode B: m2 (latent crop -> resize -> paste)
-# =========================================================================
-@torch.no_grad()
-def semantic_fusion_m2(
-    canvas_latent: torch.Tensor,
-    object_latent: torch.Tensor,
-    object_mask_img: torch.Tensor,
-    raw_base_image: Image.Image,
-    location_prompt: Optional[str],
-    target_area: str,
-    scale_factor: float,
-    use_smart_placement: bool = True,
-    mask_thr_bbox: float = 0.2,
-    overlap_mode: str = "allow",
-    occupied_mask_latent: Optional[torch.Tensor] = None,
-    alpha: float = 1.0,
-    base_unit_ratio: float = 0.6,
-    min_size: int = 8,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, C, H, W = canvas_latent.shape
-
-    # mask to latent
-    mask_lat = F.interpolate(object_mask_img, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
-    bb = bbox_from_mask(mask_lat, thr=mask_thr_bbox)
-    if bb is None:
-        return canvas_latent, torch.zeros((B, 1, H, W), device=canvas_latent.device, dtype=canvas_latent.dtype)
-
-    y0, y1, x0, x1 = bb
-    obj_crop = object_latent[:, :, y0:y1 + 1, x0:x1 + 1]
-    mask_crop = mask_lat[:, :, y0:y1 + 1, x0:x1 + 1]
-
-    h_old, w_old = obj_crop.shape[-2:]
-    base_unit = min(H, W) * float(base_unit_ratio)
-    target_long_edge = int(base_unit * float(scale_factor))
-    target_long_edge = max(min_size, min(target_long_edge, min(H, W) - 2))
-
-    ratio = target_long_edge / max(h_old, w_old)
-    h_new = max(1, int(h_old * ratio))
-    w_new = max(1, int(w_old * ratio))
-
-    obj_rs = F.interpolate(obj_crop, size=(h_new, w_new), mode="bicubic", align_corners=False)
-    mask_rs = F.interpolate(mask_crop, size=(h_new, w_new), mode="bilinear", align_corners=False)
-
-    # coords
-    effective_smart = False
-    if use_smart_placement and location_prompt and raw_base_image is not None:
-        coords = get_text_guided_coords(raw_base_image, location_prompt, h_new, w_new, (H, W))
-        if coords:
-            ts_h, te_h, ts_w, te_w = coords
-            effective_smart = True
-
-    if not effective_smart:
-        ts_h, te_h, ts_w, te_w = _calculate_dynamic_coords(H, W, h_new, w_new, target_area)
-
-    ts_h, te_h, ts_w, te_w = clamp_coords(ts_h, te_h, ts_w, te_w, H, W)
-
-    base_p = safe_patch_slice(canvas_latent, ts_h, te_h, ts_w, te_w)
-    if base_p.shape[-2:] != obj_rs.shape[-2:]:
-        obj_rs = F.interpolate(obj_rs, size=base_p.shape[-2:], mode="bicubic", align_corners=False)
-        mask_rs = F.interpolate(mask_rs, size=base_p.shape[-2:], mode="bilinear", align_corners=False)
-
-    m_eff = (mask_rs * float(alpha)).clamp(0, 1)
-
-    if overlap_mode != "allow" and occupied_mask_latent is not None:
-        occ_p = safe_patch_slice(occupied_mask_latent, ts_h, te_h, ts_w, te_w).clamp(0, 1)
-        if overlap_mode == "no_overwrite":
-            m_eff = m_eff * (1.0 - (occ_p > 0.2).float())
-        elif overlap_mode == "alpha":
-            m_eff = m_eff * (1.0 - 0.5 * occ_p)
-
-    new_canvas = canvas_latent.clone()
-    new_canvas[:, :, ts_h:te_h, ts_w:te_w] = m_eff * obj_rs + (1.0 - m_eff) * base_p
-
-    union_mask = torch.zeros((B, 1, H, W), device=new_canvas.device, dtype=new_canvas.dtype)
-    union_mask[:, :, ts_h:te_h, ts_w:te_w] = m_eff.clamp(0, 1)
-
-    return new_canvas, union_mask
-
-
-# =========================================================================
-# Main pipeline
-# =========================================================================
-def stage1_run(
+# -------------------------------------------------------------------------
+# Stage1 unified
+# -------------------------------------------------------------------------
+def stage1_composition(
     base_image_path: str,
-    objects_list: List[Dict[str, Any]],
-    output_dir: str,
-    fused_prefix: str,
-    t_size: int = 448,
-    global_scales: List[float] = [1.0],
-
-    fusion_mode: str = "v2",            # v2 | m2
-    rerank_clip: bool = True,           # only meaningful for v2
-    overlap_mode: str = "no_overwrite", # allow | no_overwrite | alpha
-
+    objects_list: List[Dict],
+    output_path: str,
+    fused_path_prefix: str,
+    global_scale_factors: List[float],
+    overlap_mode: str = "allow",
+    rerank_clip: bool = False,
     clip_model_id: str = "openai/clip-vit-base-patch32",
-    default_lambda_overlap: float = 0.3,
 ):
-    os.makedirs(output_dir, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    os.makedirs(output_path, exist_ok=True)
+    ts = timestamp_str()
 
-    # Load base
     base_img_tensor = load_and_transform(base_image_path, t_size).to(device=device)
-    base_pil = Image.open(base_image_path).convert("RGB")
+    base_pil_image = Image.open(base_image_path).convert("RGB")
 
-    # sort objects
     objects_sorted = sorted(objects_list, key=lambda d: d.get("z_order", 0))
 
-    # models
     manager = ModelManager(device=device)
     rae = manager.load_rae()
-
-    clip_scorer = None
-    if rerank_clip:
-        clip_scorer = CLIPScorerTF(device=device, model_id=clip_model_id)
-
+    clip_scorer = CLIPScorerTF(device=device, model_id=clip_model_id) if rerank_clip else None
     cleanup_memory()
 
-    # Encode base once
     with torch.amp.autocast("cuda", dtype=DTYPE_MODERN):
         base_latent_init = rae.encode(base_img_tensor)
 
-    # Pre-encode objects once
+    # Pre-encode all objects once
     encoded_objects = []
     for conf in objects_sorted:
-        path = conf["path"]
-        text = conf["text"]
-        if not os.path.exists(path):
-            print(f"[Warn] missing object image: {path}")
-            continue
-
-        r_pil = Image.open(path).convert("RGB")
+        r_pil = Image.open(conf["path"]).convert("RGB")
         obj_t, obj_m = get_cropped_object_tensor(
             raw_image=r_pil,
-            target_text=text,
+            target_text=conf["text"],
+            scale_factor=1.0,  # keep encode quality same as your code
+            background_mode="mean",
             target_size_for_encoder=t_size,
-            background_mode=str(conf.get("background_mode", "mean")),
-            clipseg_threshold=float(conf.get("clipseg_threshold", 0.3)),
         )
         with torch.amp.autocast("cuda", dtype=DTYPE_MODERN):
             obj_l = rae.encode(obj_t)
-
         encoded_objects.append({"latent": obj_l, "mask_img": obj_m, "config": conf})
 
-    def make_scale_pt(prefix: str, g: float) -> str:
+    def make_scale_path(prefix: str, g: float) -> str:
         root, ext = os.path.splitext(prefix)
         if ext == "":
             ext = ".pt"
         return f"{root}_scale_{g}{ext}"
 
-    # Run for each global scale
-    for gscale in global_scales:
+    for gscale in global_scale_factors:
+        print(f"\n--- [Stage1] Global scale = {gscale} ---")
         canvas_latent = base_latent_init.clone()
         B, C, H, W = canvas_latent.shape
 
@@ -449,157 +419,156 @@ def stage1_run(
 
         for item in encoded_objects:
             conf = item["config"]
-
-            base_scale = float(conf.get("base_scale", 1.0))
-            final_sc = float(gscale * base_scale)
-
             location_prompt = conf.get("location_prompt", None)
             target_area = conf.get("target_area", "center")
             use_smart = bool(conf.get("use_smart", True))
             alpha = float(conf.get("alpha", 1.0))
+            base_scale = float(conf.get("base_scale", 1.0))
 
-            # ---- mode: v2 with optional rerank ----
-            if fusion_mode == "v2":
-                if rerank_clip and clip_scorer is not None:
-                    # build score prompt
-                    scene_prompt = conf.get("scene_prompt", "")
-                    control_prompt = conf.get("control_prompt", conf["text"])
-                    text_for_score = (scene_prompt + " " + control_prompt).strip()
+            use_adaptive = bool(conf.get("use_adaptive_scale", False))
 
-                    num_cand = int(conf.get("num_candidates", 12))
-                    jitter = float(conf.get("jitter", 0.12))
-                    lambda_overlap = float(conf.get("lambda_overlap", default_lambda_overlap))
+            # base scale (default)
+            final_sc = float(gscale * base_scale)
 
-                    candidate_scales = conf.get("candidate_scales", [final_sc])
-                    if not isinstance(candidate_scales, (list, tuple)):
-                        candidate_scales = [float(candidate_scales)]
-                    candidate_scales = [float(x) for x in candidate_scales]
+            # candidate scales
+            if use_adaptive and location_prompt:
+                print(f"Object: {conf['text']} | adaptive scale based on '{location_prompt}'")
+                adaptive_sc = calculate_adaptive_scale(
+                    base_pil_image=base_pil_image,
+                    location_prompt=location_prompt,
+                    H=H, W=W,
+                    gamma=float(conf.get("gamma", 0.5)),
+                    eta=float(conf.get("eta", 0.9)),
+                    min_scale=float(conf.get("min_scale", 0.2)),
+                    max_scale=float(conf.get("max_scale", 0.8)),
+                )
+                candidate_scales = [adaptive_sc * 0.9, adaptive_sc * 1.0, adaptive_sc * 1.1]
+            else:
+                candidate_scales = conf.get("candidate_scales", [final_sc])
+                if not isinstance(candidate_scales, (list, tuple)):
+                    candidate_scales = [float(candidate_scales)]
+                candidate_scales = [float(x) for x in candidate_scales]
 
-                    best_total = None
-                    best_canvas = None
-                    best_union = None
-
-                    for sc in candidate_scales:
-                        # estimate object patch size (from scaled mask bbox)
-                        mask_l = F.interpolate(item["mask_img"], size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
-                        _, m_sc = scale_in_latent_canvas(item["latent"], mask_l, scale_factor=sc)
-                        m_sc = feather_mask(m_sc, iters=2, k=3)
-
-                        bb = bbox_from_mask(m_sc, thr=float(conf.get("mask_thr_bbox", 0.2)))
-                        if bb is None:
-                            continue
-                        ph = int(bb[1] - bb[0] + 1)
-                        pw = int(bb[3] - bb[2] + 1)
-
-                        # base coords
-                        base_coords = None
-                        if use_smart and location_prompt:
-                            base_coords = get_text_guided_coords(
-                                base_pil_image=base_pil,
-                                prompt=location_prompt,
-                                patch_h=ph,
-                                patch_w=pw,
-                                feat_hw=(H, W),
-                                avoid_mask=occupied,
-                                avoid_strength=float(10.0),
-                                avoid_thr=float(0.05),
-                            )
-
-                        if base_coords is None:
-                            base_coords = _calculate_dynamic_coords(H, W, ph, pw, target_area)
-                        base_coords = tuple(int(x) for x in base_coords)
-
-                        cand_coords = generate_candidate_coords(H, W, ph, pw, base_coords, num=num_cand, jitter=jitter)
-
-                        cand_canvases = []
-                        cand_unions = []
-
-                        for coords in cand_coords:
-                            c_can, c_uni = semantic_fusion_v2(
-                                canvas_latent=canvas_latent,
-                                object_latent=item["latent"],
-                                object_mask_img=item["mask_img"],
-                                raw_base_image=base_pil,
-                                location_prompt=location_prompt,
-                                target_area=target_area,
-                                scale_factor=sc,
-                                use_smart_placement=False,
-                                overlap_mode=overlap_mode,
-                                occupied_mask_latent=occupied,
-                                forced_coords=coords,
-                                alpha=alpha,
-                                mask_thr_bbox=float(conf.get("mask_thr_bbox", 0.2)),
-                                feather_iters=int(conf.get("feather_iters", 2)),
-                                feather_k=int(conf.get("feather_k", 3)),
-                            )
-                            cand_canvases.append(c_can)
-                            cand_unions.append(c_uni)
-
-                        if not cand_canvases:
-                            continue
-
-                        cand_batch = torch.cat(cand_canvases, dim=0)
-                        with torch.no_grad():
-                            decoded = rae.decode(cand_batch).clamp(0, 1)
-
-                        scores_clip = clip_scorer.score(decoded, [text_for_score] * decoded.shape[0])
-
-                        overlaps = torch.stack([(u * occupied).mean() for u in cand_unions]).to(scores_clip.device)
-                        scores_total = scores_clip - float(lambda_overlap) * overlaps
-
-                        idx = int(torch.argmax(scores_total).item())
-                        total_best = float(scores_total[idx].item())
-
-                        if best_total is None or total_best > best_total:
-                            best_total = total_best
-                            best_canvas = cand_canvases[idx]
-                            best_union = cand_unions[idx]
-
-                    if best_canvas is None:
-                        best_canvas, best_union = semantic_fusion_v2(
-                            canvas_latent=canvas_latent,
-                            object_latent=item["latent"],
-                            object_mask_img=item["mask_img"],
-                            raw_base_image=base_pil,
-                            location_prompt=location_prompt,
-                            target_area=target_area,
-                            scale_factor=final_sc,
-                            use_smart_placement=use_smart,
-                            overlap_mode=overlap_mode,
-                            occupied_mask_latent=occupied,
-                            alpha=alpha,
-                            mask_thr_bbox=float(conf.get("mask_thr_bbox", 0.2)),
-                            feather_iters=int(conf.get("feather_iters", 2)),
-                            feather_k=int(conf.get("feather_k", 3)),
-                        )
-
-                    canvas_latent, union_mask = best_canvas, best_union
-
-                else:
-                    canvas_latent, union_mask = semantic_fusion_v2(
-                        canvas_latent=canvas_latent,
-                        object_latent=item["latent"],
-                        object_mask_img=item["mask_img"],
-                        raw_base_image=base_pil,
-                        location_prompt=location_prompt,
-                        target_area=target_area,
-                        scale_factor=final_sc,
-                        use_smart_placement=use_smart,
-                        overlap_mode=overlap_mode,
-                        occupied_mask_latent=occupied,
-                        alpha=alpha,
-                        mask_thr_bbox=float(conf.get("mask_thr_bbox", 0.2)),
-                        feather_iters=int(conf.get("feather_iters", 2)),
-                        feather_k=int(conf.get("feather_k", 3)),
-                    )
-
-            # ---- mode: m2 ----
-            elif fusion_mode == "m2":
-                canvas_latent, union_mask = semantic_fusion_m2(
+            # If no rerank, just do single placement once (same as your v2 basic)
+            if not rerank_clip:
+                canvas_latent, union_mask = semantic_fusion_v2(
                     canvas_latent=canvas_latent,
                     object_latent=item["latent"],
                     object_mask_img=item["mask_img"],
-                    raw_base_image=base_pil,
+                    raw_base_image=base_pil_image,
+                    location_prompt=location_prompt,
+                    target_area=target_area,
+                    scale_factor=candidate_scales[0],
+                    use_smart_placement=use_smart,
+                    overlap_mode=overlap_mode,
+                    occupied_mask_latent=occupied,
+                    alpha=alpha,
+                )
+                union_total = (union_total + union_mask).clamp(0, 1)
+                occupied = (occupied + union_mask).clamp(0, 1)
+                print(f"  + Fuse '{conf['text']}' scale={candidate_scales[0]:.3f} (no rerank)")
+                continue
+
+            # Rerank path (CLIP + overlap penalty)
+            scene_prompt = conf.get("scene_prompt", "")
+            control_prompt = conf.get("control_prompt", conf["text"])
+            text_for_score = (scene_prompt + " " + control_prompt).strip()
+
+            num_cand = int(conf.get("num_candidates", 12))
+            jitter = float(conf.get("jitter", 0.12))
+            lambda_overlap = float(conf.get("lambda_overlap", 0.3))
+
+            best_total = None
+            best_canvas = None
+            best_union = None
+            best_clip = None
+            best_ov = None
+            best_sc = None
+
+            for sc in candidate_scales:
+                # estimate patch size from scaled mask bbox
+                mask_l = F.interpolate(item["mask_img"], size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
+                _, m_sc = scale_in_latent_canvas(item["latent"], mask_l, scale_factor=sc)
+                m_sc = feather_mask(m_sc, iters=2, k=3)
+                bb = bbox_from_mask(m_sc, thr=0.2)
+                if bb is None:
+                    continue
+                ph = int(bb[1] - bb[0] + 1)
+                pw = int(bb[3] - bb[2] + 1)
+
+                base_coords = None
+                if use_smart and location_prompt:
+                    base_coords = get_text_guided_coords(
+                        base_pil_image,
+                        location_prompt,
+                        ph,
+                        pw,
+                        (H, W),
+                        avoid_mask=occupied,
+                        avoid_strength=float(10.0),
+                        avoid_thr=float(0.05),
+                    )
+                if base_coords is None:
+                    base_coords = _calculate_dynamic_coords(H, W, ph, pw, target_area)
+
+                base_coords = tuple(int(x) for x in base_coords)
+                cand_coords = generate_candidate_coords(H, W, ph, pw, base_coords, num=num_cand, jitter=jitter)
+
+                cand_canvases: List[torch.Tensor] = []
+                cand_unions: List[torch.Tensor] = []
+                for coords in cand_coords:
+                    c_can, c_uni = semantic_fusion_v2(
+                        canvas_latent=canvas_latent,
+                        object_latent=item["latent"],
+                        object_mask_img=item["mask_img"],
+                        raw_base_image=base_pil_image,
+                        location_prompt=location_prompt,
+                        target_area=target_area,
+                        scale_factor=sc,
+                        use_smart_placement=False,
+                        overlap_mode=overlap_mode,
+                        occupied_mask_latent=occupied,
+                        forced_coords=coords,
+                        alpha=alpha,
+                    )
+                    cand_canvases.append(c_can)
+                    cand_unions.append(c_uni)
+
+                if not cand_canvases:
+                    continue
+
+                cand_batch = torch.cat(cand_canvases, dim=0)
+                decoded = rae.decode(cand_batch).clamp(0, 1)
+
+                scores_clip = clip_scorer.score(decoded, [text_for_score] * decoded.shape[0])  # [N]
+
+                overlaps = []
+                for u in cand_unions:
+                    overlaps.append((u * occupied).mean())
+                overlaps = torch.stack(overlaps).to(scores_clip.device)
+
+                scores_total = scores_clip - lambda_overlap * overlaps
+
+                idx = int(torch.argmax(scores_total).item())
+                clip_best = float(scores_clip[idx].item())
+                ov_best = float(overlaps[idx].item())
+                total_best = float(scores_total[idx].item())
+
+                if best_total is None or total_best > best_total:
+                    best_total = total_best
+                    best_canvas = cand_canvases[idx]
+                    best_union = cand_unions[idx]
+                    best_clip = clip_best
+                    best_ov = ov_best
+                    best_sc = sc
+
+            if best_canvas is None:
+                # fallback
+                best_canvas, best_union = semantic_fusion_v2(
+                    canvas_latent=canvas_latent,
+                    object_latent=item["latent"],
+                    object_mask_img=item["mask_img"],
+                    raw_base_image=base_pil_image,
                     location_prompt=location_prompt,
                     target_area=target_area,
                     scale_factor=final_sc,
@@ -607,24 +576,26 @@ def stage1_run(
                     overlap_mode=overlap_mode,
                     occupied_mask_latent=occupied,
                     alpha=alpha,
-                    mask_thr_bbox=float(conf.get("mask_thr_bbox", 0.2)),
-                    base_unit_ratio=float(conf.get("m2_base_unit_ratio", 0.6)),
-                    min_size=int(conf.get("m2_min_size", 8)),
                 )
+                print(f"Object: {conf['text']} | fallback (no candidate)")
             else:
-                raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+                print(
+                    f"Object: {conf['text']} | scale={best_sc:.3f} | "
+                    f"Total={best_total:.4f} CLIP={best_clip:.4f} Overlap={best_ov:.4f}"
+                )
 
+            canvas_latent = best_canvas
+            union_mask = best_union
             union_total = (union_total + union_mask).clamp(0, 1)
             occupied = (occupied + union_mask).clamp(0, 1)
 
-        # decode preview
-        with torch.no_grad():
-            preview = rae.decode(canvas_latent).clamp(0, 1)
-
-        out_png = os.path.join(output_dir, f"check_{fusion_mode}_g{gscale}_{ts}.png")
+        # preview
+        preview = rae.decode(canvas_latent).clamp(0, 1)
+        out_png = os.path.join(output_path, f"check_{gscale}_{ts}.png")
         save_image(preview.float(), out_png)
 
-        out_pt = make_scale_pt(fused_prefix, gscale)
+        # save pt
+        out_pt = make_scale_path(fused_path_prefix, gscale)
         torch.save(
             {
                 "fused_features": canvas_latent.detach().cpu(),
@@ -634,66 +605,70 @@ def stage1_run(
                 "base_image": base_image_path,
                 "objects_info": objects_sorted,
                 "timestamp": ts,
-                "fusion_mode": fusion_mode,
                 "overlap_mode": overlap_mode,
-                "rerank": None if not rerank_clip else {
-                    "clip_model": clip_model_id,
-                    "image_size": 224,
-                    "lambda_overlap_default": default_lambda_overlap,
-                },
+                "rerank_clip": bool(rerank_clip),
+                "clip_model": clip_model_id if rerank_clip else None,
             },
             out_pt,
         )
 
-        print(f"[OK] Saved pt: {out_pt}")
-        print(f"[OK] Preview: {out_png}")
+        print(f"Saved: {out_pt}")
+        print(f"Preview: {out_png}")
 
+    del rae
     cleanup_memory()
+    print("\n--- [Stage1] Completed ---")
 
 
-# =========================================================================
+# -------------------------------------------------------------------------
 # CLI
-# =========================================================================
-def parse_args():
-    p = argparse.ArgumentParser("Stage1 Runner (merged options)")
-    p.add_argument("--base", type=str, required=True, help="base image path")
-    p.add_argument("--objects", type=str, required=True, help="objects json path (list of dicts)")
-    p.add_argument("--outdir", type=str, required=True, help="output dir for previews")
-    p.add_argument("--fused_prefix", type=str, required=True, help="prefix path for saving pt (e.g. out/fused.pt)")
-    p.add_argument("--t_size", type=int, default=448)
-
-    p.add_argument("--global_scales", type=str, default="1.0", help="comma list, e.g. 0.3,0.35,0.4")
-    p.add_argument("--fusion_mode", type=str, default="v2", choices=["v2", "m2"])
-    p.add_argument("--overlap_mode", type=str, default="no_overwrite", choices=["allow", "no_overwrite", "alpha"])
-
-    p.add_argument("--rerank_clip", type=int, default=1, help="1 enable CLIP rerank (only v2), 0 disable")
-    p.add_argument("--clip_model_id", type=str, default="openai/clip-vit-base-patch32")
-    p.add_argument("--lambda_overlap_default", type=float, default=0.3)
-    return p.parse_args()
+# -------------------------------------------------------------------------
+def parse_list_floats(vals: List[str]) -> List[float]:
+    # accept: "0.3,0.35,0.4" OR "0.3 0.35 0.4"
+    if len(vals) == 1 and "," in vals[0]:
+        return [float(x.strip()) for x in vals[0].split(",") if x.strip()]
+    return [float(x) for x in vals]
 
 
-def main():
-    args = parse_args()
-    with open(args.objects, "r", encoding="utf-8") as f:
-        objects_list = json.load(f)
-    assert isinstance(objects_list, list), "objects json must be a list[dict]"
+def load_objects_json(path: str) -> List[Dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert isinstance(data, list), "objects json must be a list of dict"
+    return data
 
-    global_scales = [float(x) for x in args.global_scales.split(",") if x.strip()]
 
-    stage1_run(
-        base_image_path=args.base,
-        objects_list=objects_list,
-        output_dir=args.outdir,
-        fused_prefix=args.fused_prefix,
-        t_size=args.t_size,
-        global_scales=global_scales,
-        fusion_mode=args.fusion_mode,
-        rerank_clip=bool(args.rerank_clip),
-        overlap_mode=args.overlap_mode,
-        clip_model_id=args.clip_model_id,
-        default_lambda_overlap=args.lambda_overlap_default,
-    )
+def build_argparser():
+    p = argparse.ArgumentParser("Stage1 unified (basic / clip rerank / adaptive scale)")
+    p.add_argument("--base", "-b", required=True, help="base image path")
+    p.add_argument("--objects", "-j", required=True, help="objects json path (list of dict)")
+    p.add_argument("--out", "-o", required=True, help="output dir for previews and pt")
+    p.add_argument("--fused_prefix", "-p", default=None, help="pt prefix path, default: <out>/fused_results.pt")
+    p.add_argument("--gscales", nargs="+", default=["0.3", "0.35", "0.4", "0.45", "0.5"],
+                   help="global scales, e.g. --gscales 0.3 0.35 0.4 or --gscales 0.3,0.35,0.4")
+    p.add_argument("--overlap_mode", choices=["allow", "no_overwrite", "alpha"], default="allow")
+
+    # clip rerank
+    p.add_argument("--rerank_clip", action="store_true", help="enable CLIP rerank")
+    p.add_argument("--clip_model", default="openai/clip-vit-base-patch32")
+
+    return p
 
 
 if __name__ == "__main__":
-    main()
+    args = build_argparser().parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    fused_prefix = args.fused_prefix or os.path.join(args.out, "fused_results.pt")
+    gscales = parse_list_floats(args.gscales)
+    objects_list = load_objects_json(args.objects)
+
+    stage1_composition(
+        base_image_path=args.base,
+        objects_list=objects_list,
+        output_path=args.out,
+        fused_path_prefix=fused_prefix,
+        global_scale_factors=gscales,
+        overlap_mode=args.overlap_mode,
+        rerank_clip=bool(args.rerank_clip),
+        clip_model_id=args.clip_model,
+    )
