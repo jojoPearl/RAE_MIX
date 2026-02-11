@@ -36,7 +36,7 @@ def build_optimizer(parameters: Iterable[torch.nn.Parameter], training_cfg: Dict
         betas=betas,
         weight_decay=weight_decay,
         eps=eps,
-        fused=True,
+        fused=False,
         #foreach=True,
     )
 
