@@ -46,202 +46,99 @@ from utils.dist_utils import *
 ##### Eval utils
 from eval import evaluate_generation_distributed
 
-class LatentMixer(nn.Module):
+class EdgeResidualAdapter(nn.Module):
     """
-    Switch to a CNN-based Adapter (ControlNet-Lite style).
-    Directly maps pixel-space edges (B, 3, 256, 256) to Latent-space (B, 768, 16, 16).
-    
-    Structure: 4 layers of Conv2d with stride 2.
-    256 -> 128 -> 64 -> 32 -> 16.
+    edge_rgb (B,3,256,256) -> per-layer residuals: List[(B,L,D)]
     """
-    def __init__(self, in_channels: int = 3, out_channels: int = 768):
+    def __init__(
+        self,
+        num_layers: int,
+        dec_dim: int,
+        edge_in_ch: int = 3,
+        edge_feat_ch: int = 768,
+        hw: int = 16,
+    ):
         super().__init__()
-        # Define a lightweight CNN
-        self.net = nn.Sequential(
-            # 256 -> 128
-            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),
+        self.num_layers = num_layers
+        self.dec_dim = dec_dim
+        self.hw = hw
+        self.cnn = nn.Sequential(
+            nn.Conv2d(edge_in_ch, 64, 3, 2, 1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
-            # 128 -> 64
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(64, 128, 3, 2, 1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
-            # 64 -> 32
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(128, 256, 3, 2, 1),
             nn.GroupNorm(8, 256),
             nn.SiLU(),
-            # 32 -> 16
-            nn.Conv2d(256, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, out_channels),
+            nn.Conv2d(256, edge_feat_ch, 3, 2, 1),
+            nn.GroupNorm(8, edge_feat_ch),
             nn.SiLU(),
-            # Final projection (Zero Init)
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
         )
-        
-        # Add a tiny perturbation to the last layer to avoid gradient dead-ends
-        nn.init.normal_(self.net[-1].weight, mean=0.0, std=1e-2)
-        nn.init.zeros_(self.net[-1].bias)
+        self.to_dec = nn.Linear(edge_feat_ch, dec_dim)
+        self.per_layer = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(dec_dim),
+                nn.Linear(dec_dim, dec_dim),
+            )
+            for _ in range(num_layers)
+        ])
+        for head in self.per_layer:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
 
-    def forward(self, edge_image: torch.Tensor) -> torch.Tensor:
-        # Input: (B, 3, 256, 256)
-        # Output: (B, 768, 16, 16)
-        return self.net(edge_image)
+    def forward(self, edge_rgb: torch.Tensor, Lx: int) -> list:
+        feat = self.cnn(edge_rgb)
+        B, C, H, W = feat.shape
+        assert H == self.hw and W == self.hw, f"expect {self.hw}x{self.hw}, got {H}x{W}"
+        tok = feat.flatten(2).transpose(1, 2)
+        tok = self.to_dec(tok)
+        if tok.shape[1] != Lx:
+            tok = F.interpolate(
+                tok.transpose(1, 2),
+                size=Lx,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        residuals = [head(tok) for head in self.per_layer]
+        return residuals
 
-def patch_dit_input_layer(model, extra_channels):
+
+class ResidualDDTWrapper(nn.Module):
     """
-    Full expansion for DDT:
-      Expand both s_embedder and x_embedder to accept extra channels.
+    Wrap base diffusion model:
+    - keep in_channels unchanged
+    - inject per-layer residuals from edge adapter
     """
-    targets = ["s_embedder", "x_embedder"]
-    patched_count = 0
-    new_in_channels = None
-
-    for name in targets:
-        if not hasattr(model, name):
-            continue
-        embedder = getattr(model, name)
-
-        # unwrap any previous wrapper
-        if hasattr(embedder, "original"):
-            print(f"[Patch] Unwrapping {name} before expansion...")
-            embedder = embedder.original
-
-        if hasattr(embedder, "proj"):
-            old_proj = embedder.proj
-            is_obj = True
-        elif isinstance(embedder, nn.Conv2d):
-            old_proj = embedder
-            is_obj = False
-        else:
-            continue
-
-        out_channels, old_in_channels, k_h, k_w = old_proj.weight.shape
-        if old_in_channels > 1000:
-            print(f"[Info] {name} already expanded ({old_in_channels}), skip.")
-            patched_count += 1
-            new_in_channels = old_in_channels
-            continue
-
-        new_in_channels = old_in_channels + extra_channels
-        new_proj = nn.Conv2d(
-            new_in_channels,
-            out_channels,
-            kernel_size=(k_h, k_w),
-            stride=old_proj.stride,
-            padding=old_proj.padding,
-            bias=(old_proj.bias is not None),
-        ).to(old_proj.weight.device)
-        with torch.no_grad():
-            new_proj.weight[:, :old_in_channels] = old_proj.weight
-            nn.init.normal_(new_proj.weight[:, old_in_channels:], mean=0.0, std=1e-3)
-            if old_proj.bias is not None:
-                new_proj.bias = old_proj.bias
-
-        if is_obj:
-            embedder.proj = new_proj
-            setattr(model, name, embedder)
-        else:
-            setattr(model, name, new_proj)
-
-        print(f"[Patch Success] {name} expanded: {old_in_channels} -> {new_in_channels}")
-        patched_count += 1
-
-    if new_in_channels is not None:
-        model.in_channels = new_in_channels
-    return model
-
-
-class ConcatDiTWrapper(nn.Module):
-    """
-    Concatenate noisy latent and edge latent along channel dimension.
-    """
-    def __init__(self, base_model, mixer):
+    def __init__(self, base_model, edge_adapter):
         super().__init__()
         self.base = base_model
-        self.mixer = mixer
-        self.mixer_layer0_mean = 0.0
-        self.edge_t_gate = 0.6
-        self.edge_boost = 3.0
+        self.edge_adapter = edge_adapter
+
+    def _get_Lx(self, x: torch.Tensor) -> int:
+        if hasattr(self.base, "x_embedder") and hasattr(self.base.x_embedder, "num_patches"):
+            return int(self.base.x_embedder.num_patches)
+        if hasattr(self.base, "x_patch_size"):
+            ps = int(self.base.x_patch_size)
+            return (x.shape[2] // ps) * (x.shape[3] // ps)
+        return 256
 
     def forward(self, x, t, y=None, edge_latent=None, **kwargs):
+        control_residuals = None
         if edge_latent is not None:
-            c = self.mixer(edge_latent)
-            tt = t
-            if tt.dim() == 0:
-                tt = tt.view(1, 1, 1, 1)
-            elif tt.dim() == 1:
-                tt = tt.view(-1, 1, 1, 1)
-            elif tt.dim() == 2:
-                tt = tt.view(-1, 1, 1, 1)
-            tt = tt.to(device=c.device, dtype=c.dtype)
-            boost = torch.full_like(tt, self.edge_boost)
-            one = torch.ones_like(tt)
-            w = torch.where(tt > self.edge_t_gate, boost, one)
-            c = c * w
-            with torch.no_grad():
-                self.mixer_layer0_mean = c.mean().item()
-            x_in = torch.cat([x, c], dim=1)
-        else:
-            b, _, h, w = x.shape
-            c_cond = self.base.in_channels - x.shape[1]
-            dummy_c = torch.zeros(b, c_cond, h, w, device=x.device, dtype=x.dtype)
-            x_in = torch.cat([x, dummy_c], dim=1)
-        return self.base(x_in, t, y=y, **kwargs)
+            Lx = self._get_Lx(x)
+            control_residuals = self.edge_adapter(edge_latent, Lx=Lx)
+        return self.base(x, t, y=y, control_residuals=control_residuals, **kwargs)
 
     def forward_with_cfg(self, x, t, y, cfg_scale, edge_latent=None, **kwargs):
-        b2 = x.shape[0]
-        b = b2 // 2
+        control_residuals = None
         if edge_latent is not None:
-            c = self.mixer(edge_latent)
-            c_uncond = torch.zeros_like(c)
-            c_combined = torch.cat([c, c_uncond], dim=0)
-            x_in = torch.cat([x, c_combined], dim=1)
-        else:
-            c_cond = self.base.in_channels - x.shape[1]
-            dummy = torch.zeros(b2, c_cond, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
-            x_in = torch.cat([x, dummy], dim=1)
-        return self.base.forward_with_cfg(x_in, t, y, cfg_scale, **kwargs)
-
-
-class BoundaryAwareLoss(nn.Module):
-    """
-    Sobel-based boundary alignment loss between predicted clean latent and edge map.
-    """
-    def __init__(self, device: Optional[torch.device] = None):
-        super().__init__()
-        gx = torch.tensor(
-            [[-1.0, 0.0, 1.0],
-             [-2.0, 0.0, 2.0],
-             [-1.0, 0.0, 1.0]],
-            dtype=torch.float32,
-        ).view(1, 1, 3, 3)
-        gy = torch.tensor(
-            [[-1.0, -2.0, -1.0],
-             [0.0, 0.0, 0.0],
-             [1.0, 2.0, 1.0]],
-            dtype=torch.float32,
-        ).view(1, 1, 3, 3)
-        self.register_buffer("sobel_gx", gx)
-        self.register_buffer("sobel_gy", gy)
-        if device is not None:
-            self.to(device)
-
-    def forward(self, x0_pred: torch.Tensor, edge_gt_rgb: torch.Tensor) -> torch.Tensor:
-        # edge_gt_rgb: [B, 3, 256, 256] in [0,1]
-        edge_small = F.interpolate(
-            edge_gt_rgb.mean(1, keepdim=True), size=(16, 16), mode="area"
+            Lx = self._get_Lx(x)
+            control_residuals = self.edge_adapter(edge_latent, Lx=Lx)
+        return self.base.forward_with_cfg(
+            x, t, y, cfg_scale, control_residuals=control_residuals, **kwargs
         )
-        latent_map = torch.sqrt(torch.mean(x0_pred ** 2, dim=1, keepdim=True) + 1e-8)
-        g_x = F.conv2d(latent_map, self.sobel_gx, padding=1)
-        g_y = F.conv2d(latent_map, self.sobel_gy, padding=1)
-        pred_edge = torch.sqrt(g_x ** 2 + g_y ** 2 + 1e-6)
-
-        pred_edge = pred_edge / (pred_edge.mean(dim=[2, 3], keepdim=True) + 1e-6)
-        edge_small = edge_small / (edge_small.mean(dim=[2, 3], keepdim=True) + 1e-6)
-
-        loss_boundary = F.l1_loss(pred_edge, edge_small)
-        return loss_boundary
-
 
 def annotate(img: torch.Tensor, text: str) -> torch.Tensor:
     """
@@ -267,7 +164,7 @@ def save_checkpoint(
     state = {
         "step": step,
         "epoch": epoch,
-        "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
+        "model": model.module.state_dict(),
         "ema": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -284,10 +181,7 @@ def load_checkpoint(
     scheduler: Optional[LambdaLR],
 ) -> Tuple[int, int]:
     checkpoint = torch.load(path, map_location="cpu")
-    if hasattr(model, "module"):
-        model.module.load_state_dict(checkpoint["model"])
-    else:
-        model.load_state_dict(checkpoint["model"])
+    model.module.load_state_dict(checkpoint["model"])
     ema_model.load_state_dict(checkpoint["ema"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -313,6 +207,7 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("Training currently requires at least one GPU.")
     rank, world_size = 0, 1
+    # limited by current machine
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     full_cfg = OmegaConf.load(args.config)
@@ -443,27 +338,27 @@ def main():
         except:
             pass
 
-    # === Input concatenation components ===
+    # === Scheme A: per-layer residual adapter ===
     base_model.requires_grad_(False)
     base_model.eval()
 
-    latent_mixer = LatentMixer(in_channels=3, out_channels=latent_size[0]).to(device)
-    nn.init.normal_(latent_mixer.net[-1].weight, mean=0.0, std=1e-3)
-    nn.init.zeros_(latent_mixer.net[-1].bias)
+    num_layers = len(base_model.blocks)
+    dec_dim = getattr(base_model, "decoder_hidden_size", getattr(base_model, "hidden_size", 2048))
 
-    base_model = patch_dit_input_layer(base_model, extra_channels=latent_size[0])
-    model = ConcatDiTWrapper(base_model, latent_mixer).to(device)
+    edge_adapter = EdgeResidualAdapter(
+        num_layers=num_layers,
+        dec_dim=dec_dim,
+        edge_in_ch=3,
+        edge_feat_ch=latent_size[0],
+        hw=16,
+    ).to(device)
+
+    model = ResidualDDTWrapper(base_model, edge_adapter).to(device)
     ema_model = model
     for p in model.parameters():
         p.requires_grad = False
-    for p in latent_mixer.parameters():
+    for p in edge_adapter.parameters():
         p.requires_grad = True
-    if hasattr(base_model, "x_embedder"):
-        for p in base_model.x_embedder.parameters():
-            p.requires_grad = True
-    elif hasattr(base_model, "patch_embed"):
-        for p in base_model.patch_embed.parameters():
-            p.requires_grad = True
 
     ddp_model = model
     ddp_model.train()
@@ -477,11 +372,8 @@ def main():
 
     #### Opt
     training_cfg["fused"] = False
-    trainable_params = []
-    trainable_params += list(latent_mixer.parameters())
-    trainable_params += [p for p in base_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        list(edge_adapter.parameters()),
         lr=float(training_cfg.get("optimizer", {}).get("lr", 1e-4)),
         betas=(0.9, 0.95),
         weight_decay=0.0,
@@ -566,21 +458,17 @@ def main():
             f"[Rank {rank}] Resumed from {ckpt_path} (epoch={loaded_epoch}, step={global_step})."
         )
 
-    decode_signed = None
-    if rank == 0:
-        with torch.no_grad():
-            probe = torch.randn(1, *latent_size, device=device)
-            probe_img = rae.decode(probe).detach()
-            decode_min = probe_img.min().item()
-            decode_max = probe_img.max().item()
-            decode_signed = decode_min < -0.1
-            logger.info(
-                f"[Decode Range] min={decode_min:.3f}, max={decode_max:.3f}, signed={decode_signed}"
-            )
-
     def to_01(x: torch.Tensor) -> torch.Tensor:
-        if decode_signed:
+        # x: (B, 3, H, W)
+        x = x.float()
+        signed = (x.min() < -0.05).item()
+        if signed:
             x = (x + 1.0) * 0.5
+        x_min = x.amin(dim=(1, 2, 3), keepdim=True)
+        x_max = x.amax(dim=(1, 2, 3), keepdim=True)
+        too_narrow = ((x_max - x_min) < 0.2).float()
+        x_stretch = (x - x_min) / (x_max - x_min + 1e-6)
+        x = too_narrow * x_stretch + (1 - too_narrow) * x
         return x.clamp(0, 1)
     
     # Training Loop
@@ -614,17 +502,13 @@ def main():
             edge_for_model = None if is_dropped else edge_condition
                 
             with autocast(**autocast_kwargs):
-                # ---- (A) Original diffusion loss ----
                 loss_dict = transport.training_losses(
                     train_model_fn,
                     z,
                     {"y": train_labels, "edge_latent": edge_for_model},
                     return_intermediates=False,
                 )
-                loss_diff = loss_dict["loss"].mean()
-
-                # ---- (C) Total loss ----
-                loss = loss_diff
+                loss = loss_dict["loss"].mean()
             
             loss = loss.float()
             if not loss.requires_grad:
@@ -642,8 +526,7 @@ def main():
                     if scaler:
                         scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        list(unwrap(ddp_model).mixer.parameters())
-                        + [p for p in base_model.parameters() if p.requires_grad],
+                        list(unwrap(ddp_model).edge_adapter.parameters()),
                         clip_grad,
                     )
                 if scaler:
@@ -688,14 +571,25 @@ def main():
                         p_no = train_model_fn(xt_chk, t_chk, y=y_chk, edge_latent=None)
                         diff = (p_edge - p_no).abs().mean().item()
 
-                        c = unwrap(ddp_model).mixer(e_chk)
-                        c_absmean = c.abs().mean().item()
-                        c_std = c.std().item()
+                        adapter = unwrap(ddp_model).edge_adapter
+                        if hasattr(base_model, "x_embedder") and hasattr(base_model.x_embedder, "num_patches"):
+                            Lx = int(base_model.x_embedder.num_patches)
+                        elif hasattr(base_model, "x_patch_size"):
+                            ps = int(base_model.x_patch_size)
+                            Lx = (xt_chk.shape[2] // ps) * (xt_chk.shape[3] // ps)
+                        else:
+                            Lx = 256
+                        residuals = adapter(e_chk, Lx=Lx)
+                        r0 = residuals[0]
+                        c_absmean = r0.abs().mean().item()
+                        c_std = r0.std().item()
+                        del residuals
+                        del r0
 
                         logger.info(
                             f"[EDGE_SENS] step={global_step} | "
                             f"pred_diff={diff:.3e} | "
-                            f"mixer_absmean={c_absmean:.3e} | mixer_std={c_std:.3e}"
+                            f"res_absmean={c_absmean:.3e} | res_std={c_std:.3e}"
                         )
             
             epoch_metrics['loss'] += loss.detach()
@@ -732,42 +626,40 @@ def main():
                     edge_vis_cond = (edge_vis_rgb * 2.0 - 1.0).to(device)
 
                     # -----------------------
-                    # 1) Clean latent decode (z_gt decode)
-                    # -----------------------
-                    with torch.no_grad(), autocast(**autocast_kwargs):
-                        z_gt = rae.encode(vis_images)
-                    img_clean = to_01(rae.decode(z_gt).float()).cpu()
-
-                    # -----------------------
                     # 2) Inference samples (same noise for fair compare)
                     # -----------------------
                     zs = torch.randn(n_vis, *latent_size, device=device, dtype=torch.float32)
-                    s_edge = float(training_cfg.get("edge_cfg_scale", 3.0))
 
                     with torch.no_grad(), autocast(**autocast_kwargs):
-                        def fn_edge_cfg(x, t, **kw):
-                            v_cond = ema_model_fn(x, t, y=vis_labels, edge_latent=edge_vis_cond)
-                            v_un = ema_model_fn(x, t, y=vis_labels, edge_latent=None)
-                            return v_un + s_edge * (v_cond - v_un)
+                        def fn_y_edge(x, t, **kw):
+                            return ema_model_fn(x, t, y=vis_labels, edge_latent=edge_vis_cond)
 
                         def fn_y_noedge(x, t, **kw):
                             return ema_model_fn(x, t, y=vis_labels, edge_latent=None)
 
-                        lat_edgecfg = eval_sampler(
+                        traj = eval_sampler(
                             zs,
-                            fn_edge_cfg,
+                            fn_y_edge,
                             y=vis_labels,
                             **sample_model_kwargs,
-                        )[-1]
-                        lat_noedge = eval_sampler(
+                        )
+                        lat_edge = traj[-1]
+                        del traj
+
+                        traj = eval_sampler(
                             zs,
                             fn_y_noedge,
                             y=vis_labels,
                             **sample_model_kwargs,
-                        )[-1]
+                        )
+                        lat_noedge = traj[-1]
+                        del traj
 
-                    img_edgecfg = to_01(rae.decode(lat_edgecfg).float()).cpu()
+                    img_edge = to_01(rae.decode(lat_edge).float()).cpu()
                     img_noedge = to_01(rae.decode(lat_noedge).float()).cpu()
+                    del lat_edge
+                    del lat_noedge
+                    torch.cuda.empty_cache()
 
                     # -----------------------
                     # 3) Build 5-col grid
@@ -782,17 +674,16 @@ def main():
 
                         col1 = annotate(gt_img[i], f"GT | {cls_name}")
                         col2 = annotate(gt_edge[i], "GT edge")
-                        col3 = annotate(img_clean[i], "Clean latent(z)")
-                        col4 = annotate(img_edgecfg[i], f"Infer: y+edge CFG | s={s_edge}")
-                        col5 = annotate(img_noedge[i], "Infer: y (no edge)")
+                        col3 = annotate(img_edge[i], "Infer: y + GT edge")
+                        col4 = annotate(img_noedge[i], "Infer: y (no edge)")
 
-                        row = torch.cat([col1, col2, col3, col4, col5], dim=2)
+                        row = torch.cat([col1, col2, col3, col4], dim=2)
                         rows.append(row)
 
                     final_grid = torch.cat(rows, dim=1)
                     save_path = os.path.join(
                         samples_dir,
-                        f"step_{global_step:07d}_5col_GT_Edge_Clean_EdgeCFG_NoEdge.png",
+                        f"step_{global_step:07d}_4col_GT_Edge_InferEdge_InferNoEdge.png",
                     )
                     save_image(final_grid, save_path)
                     logger.info(f"Saved: {save_path}")
