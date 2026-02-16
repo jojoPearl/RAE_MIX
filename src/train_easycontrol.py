@@ -704,7 +704,12 @@ def main() -> None:
     shift_base = misc.get("time_dist_shift_base", 4096)
     time_dist_shift = math.sqrt(shift_dim / shift_base)
 
-    experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(args, rank=0)
+    enable_log_txt = os.environ.get("ENABLE_LOG_TXT", "0") == "1"
+    save_worktree_flag = os.environ.get("SAVE_WORKTREE", "0") == "1"
+
+    experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(
+        args, rank=0, enable_file_log=enable_log_txt
+    )
     os.makedirs(checkpoint_dir, exist_ok=True)
     samples_dir = os.path.join(experiment_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
@@ -721,7 +726,7 @@ def main() -> None:
         except Exception as exc:
             logger.warning(f"Failed to load class names: {exc}")
 
-    if os.path.isdir(experiment_dir):
+    if save_worktree_flag and os.path.isdir(experiment_dir):
         save_worktree(experiment_dir, full_cfg)
 
     logger.info("Loading RAE...")
@@ -800,6 +805,18 @@ def main() -> None:
         return_edges=True,
         ilsvrc_class_index_path=ilsvrc_class_index,
     )
+    dataset_num_classes = len(getattr(loader.dataset, "classes", []))
+    expected_num_classes = int(misc.get("num_classes", 1000))
+    if dataset_num_classes > 0:
+        logger.info(
+            f"Dataset classes={dataset_num_classes}, model classes={expected_num_classes}, "
+            f"class mapping={'on' if ilsvrc_class_index else 'off'}"
+        )
+    if (not ilsvrc_class_index) and dataset_num_classes > 0 and dataset_num_classes != expected_num_classes:
+        logger.warning(
+            "ilsvrc_class_index is not set while dataset class count differs from model num_classes. "
+            "ImageFolder labels will be re-indexed and class conditioning will mismatch."
+        )
 
     transport_params = dict(transport_cfg_dict.get("params", {}))
     transport_params.pop("time_dist_shift", None)
