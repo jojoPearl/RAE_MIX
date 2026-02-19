@@ -23,7 +23,7 @@ stage_2:
     depth: [28, 2]
     num_heads: [16, 16]
     mlp_ratio: 4.0
-    class_dropout_prob: 0.1
+    class_dropout_prob: 0.05
     num_classes: 1000
     use_qknorm: false
     use_swiglu: true
@@ -55,64 +55,72 @@ guidance:
   t_max: 1.0
 
 misc:
-  latent_size: [768, 16, 16] # [C, H, W]
+  latent_size: [768, 16, 16]
   num_classes: 1000
-  time_dist_shift_dim: 196608 # 16*16*768
+  time_dist_shift_dim: 196608
   time_dist_shift_base: 4096
-  
-# eval:
-#   eval_interval: 25000 # every 10 epochs
-#   eval_model: true
-#   data_path: 'data/imagenet/val/'
-#   reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
 
 training:
+  dit_checkpoint: /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/models/DiTs/Dinov2/wReg_base/ImageNet256/DiTDH-XL/stage2_model.pt
+
   max_steps: 90000
+  global_seed: 42
+  num_workers: 16
 
   batch_size: 2
-  global_batch_size: 2
+  global_batch_size: 16
+  accum_steps: 8
 
   log_every: 100
-  sample_every: 3000
-  save_every: 5000
+  sample_every: 500
+  save_every: 10000
+  checkpoint_interval: 10000
+  keep_last_n_checkpoints: 5
 
   # -------- data dropout --------
-  edge_dropout: 0.1
-  label_drop_rate: 0.15
+  edge_dropout: 0.10
+  label_drop_rate: 0.05
+  ilsvrc_class_index: /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/assets/imagenet_class_index.json
 
   # -------- control strength --------
-  control_scale_train_max: 2.5
-  control_scale_train: 2.5
+  control_scale_train_max: 2.0
+  control_scale_train: 2.0
   randomize_control_scale_train: true
+  control_scale_warmup_steps: 1000
+  control_scale_warmup_factor: 0.80
 
-  control_scale_sample: 3.5
-  ablation_control_scale: 8.0
+  control_scale_sample: 2.8
+  ablation_control_scale: 6.0
 
   # -------- CFG --------
-  cfg_scale: 1.2
+  cfg_scale: 1.5
   cfg_t_min: 0.0
   cfg_t_max: 1.0
 
   # -------- adapter hyperparams --------
+  condition_latent_dim: 768
+  condition_patch_size: 4
   lora_rank: 16
   lora_alpha: 16.0
-  qkv_scale: 0.02
-  control_clamp: 2.5
+  qkv_scale: 0.018
+  control_clamp: 3.0
 
   encoder_layer_decay: 0.99
-  decoder_layer_decay: 0.97
+  decoder_layer_decay: 0.96
+  encoder_warmup_steps: 1500
 
   # -------- optimizer --------
-  lr: 3.0e-5
+  lr: 5.0e-5
 
   optimizer:
-    lr: 3.0e-5
+    lr: 5.0e-5
     betas: [0.9, 0.95]
     weight_decay: 0.0
 
   scheduler:
     type: linear
     warmup_epochs: 0
-    decay_end_epoch: 0
-    base_lr: 3.0e-5
-    final_lr: 3.0e-5
+    warmup_steps: 2000
+    base_lr: 5.0e-5
+    final_lr: 2.0e-5
+    warmup_from_zero: false
