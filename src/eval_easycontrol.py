@@ -133,7 +133,7 @@ def compute_canny01(img01: torch.Tensor, low: float = 0.1, high: float = 0.2) ->
         gray = kornia.color.rgb_to_grayscale(x)
     else:
         gray = x
-    edges, _ = kornia.filters.canny(gray, low_threshold=low, high_threshold=high)
+    _, edges = kornia.filters.canny(gray, low_threshold=low, high_threshold=high)
     return edges.clamp(0, 1)
 
 
@@ -417,7 +417,8 @@ def main() -> None:
                 lat_b, _ = lat_b.chunk(2, dim=0)
                 img_b = rae.decode(lat_b).clamp(0, 1)
 
-            condition_cfg = torch.cat([condition, condition], dim=0)
+            condition_null = torch.zeros_like(condition)
+            condition_cfg = torch.cat([condition, condition_null], dim=0)
             with autocast(**autocast_kwargs):
                 lat_c = eval_sampler(
                     z_cfg,
@@ -427,7 +428,6 @@ def main() -> None:
                     cfg_interval=cfg_interval,
                     condition_image=condition_cfg,
                     control_scale=float(args.control_scale),
-                    global_step=0,
                 )[-1]
                 lat_c, _ = lat_c.chunk(2, dim=0)
                 img_c = rae.decode(lat_c).clamp(0, 1)
@@ -465,6 +465,7 @@ def main() -> None:
                 canny_gt,
                 canny_rgb,
                 condition,
+                condition_null,
                 condition_cfg,
                 gt_img,
                 gt_labels,

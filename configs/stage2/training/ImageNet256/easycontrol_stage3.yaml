@@ -63,7 +63,7 @@ misc:
 training:
   dit_checkpoint: /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/models/DiTs/Dinov2/wReg_base/ImageNet256/DiTDH-XL/stage2_model.pt
 
-  max_steps: 90000
+  max_steps: 150000
   global_seed: 42
   num_workers: 16
 
@@ -78,18 +78,20 @@ training:
   keep_last_n_checkpoints: 5
 
   # -------- data dropout --------
-  edge_dropout: 0.10
+  edge_dropout: 0.03
   label_drop_rate: 0.05
   ilsvrc_class_index: /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/assets/imagenet_class_index.json
 
   # -------- control strength --------
-  control_scale_train_max: 2.0
-  control_scale_train: 2.0
+  control_scale_train_min: 0.6
+  control_scale_train_max: 2.4
+  control_scale_train: 2.4
   randomize_control_scale_train: true
   control_scale_warmup_steps: 1000
   control_scale_warmup_factor: 0.80
 
-  control_scale_sample: 2.8
+  control_scale_sample: 2.4
+  align_control_scale_sample_to_train_max: true
   ablation_control_scale: 6.0
 
   # -------- CFG --------
@@ -104,10 +106,14 @@ training:
   lora_alpha: 16.0
   qkv_scale: 0.018
   control_clamp: 3.0
+  final_residual_scale: 0.45
+  encoder_residual_norm: layernorm
+  encoder_norm_eps: 1.0e-6
 
   encoder_layer_decay: 0.99
   decoder_layer_decay: 0.96
   encoder_warmup_steps: 1500
+  warmup_mode: scale_only
 
   # -------- optimizer --------
   lr: 5.0e-5

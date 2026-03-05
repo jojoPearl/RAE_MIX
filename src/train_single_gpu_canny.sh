@@ -15,6 +15,8 @@ export OPENCV_OPENCL_RUNTIME=disabled
 export CUDA_VISIBLE_DEVICES=0
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-easycontrol_full}"
 export ENTITY="${ENTITY:-claraxu}"
+export ENABLE_LOG_TXT="${ENABLE_LOG_TXT:-0}"
+export SAVE_WORKTREE="${SAVE_WORKTREE:-0}"
 
 DATA_PATH="/home/bjia-25/workspace/papers/RAE/datasets/imagenet/train"
 RESULT_DIR="ckpts/easycontrol"
@@ -26,13 +28,14 @@ CONFIG_STAGE3="configs/stage2/training/ImageNet256/easycontrol_stage3.yaml"
 CKPT_DIR="${RESULT_DIR}/${EXPERIMENT_NAME}/checkpoints"
 LOG_DIR="${RESULT_DIR}/${EXPERIMENT_NAME}"
 mkdir -p "$LOG_DIR"
+RUN_LOG="${RUN_LOG:-${LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log}"
 
 FORCE_FRESH="${FORCE_FRESH:-0}"
 NOHUP="${NOHUP:-1}"
 
 STAGE1_END=10000
 STAGE2_END=30000
-STAGE3_END=60000
+STAGE3_END=150000
 
 echo "======================================"
 echo "EasyControl chained stages"
@@ -109,8 +112,6 @@ run_one_stage() {
     exit 1
   fi
 
-  local stage_log="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S)_${stage}.log"
-
   local cmd=(python -u src/train_easycontrol.py
     --config "$cfg"
     --data-path "$DATA_PATH"
@@ -135,13 +136,13 @@ run_one_stage() {
   else
     echo "Resume: (none)"
   fi
-  echo "Log: $stage_log"
+  echo "Log: $RUN_LOG"
   echo "Command:"
   printf '  %q' "${cmd[@]}"
   echo
   echo "--------------------------------------"
 
-  "${cmd[@]}" 2>&1 | tee "$stage_log"
+  "${cmd[@]}"
 }
 
 controller_main() {
@@ -196,14 +197,19 @@ controller_main() {
 
 if [ "$NOHUP" = "1" ] && [ "${RUNNING_IN_NOHUP:-0}" != "1" ]; then
   export RUNNING_IN_NOHUP=1
-  controller_log="${LOG_DIR}/controller_$(date +%Y%m%d_%H%M%S).log"
+  export RUN_LOG
   echo "Launching controller in background (nohup)."
-  echo "Controller log: $controller_log"
-  nohup bash "$0" "$@" > "$controller_log" 2>&1 &
+  echo "Unified log: $RUN_LOG"
+  nohup bash "$0" "$@" > "$RUN_LOG" 2>&1 &
   echo "Controller PID: $!"
-  echo "Tail with: tail -f $controller_log"
+  echo "Tail with: tail -f $RUN_LOG"
   exit 0
 fi
+
+if [ "${RUNNING_IN_NOHUP:-0}" != "1" ]; then
+  exec > >(tee -a "$RUN_LOG") 2>&1
+fi
+echo "Unified log: $RUN_LOG"
 
 controller_main
 
@@ -224,11 +230,75 @@ controller_main
 #   --image-size 256 --precision fp32 \
 #   > ckpts/training_log.out 2>&1 &
 #
+# nohup
+# CUDA_VISIBLE_DEVICES=0 
 # python src/train_easycontrol.py \
 #   --config /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv2-B_test.yaml \
 #   --data-path /home/bjia-25/workspace/papers/RAE/datasets/imagenet/train \
 #   --results-dir ckpts/easycontrol \
 #   --image-size 256 \
 #   --precision fp32
+#  > ckpts/training_log.out 2>&1 &
 #
 # echo "Training started in background. PID: $!"
+
+# nohup python src/sample_dump.py \
+#   --config /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-train_easycontrol.yaml \
+#   --data-path /home/bjia-25/workspace/papers/RAE/datasets/imagenet/val \
+#   --image-size 256 \
+#   --precision bf16 \
+#   --num-samples 10000 \
+#   --batch-size 2 \
+#   --outdir eval_10k  > training_log.out 2>&1 &
+
+
+# 10k
+# python RAE_MIX/src/sample_dump.py \
+#   --config /path/to/config.yaml \
+#   --data-path /path/to/val \
+#   --adapter-ckpt /path/to/adapter.pt \
+#   --num-samples 10000 \
+#   --batch-size 4 \
+#   --outdir out_dump_10k
+
+# # offline eval (control only)
+# python RAE_MIX/src/eval_from_folders.py --root out_dump_10k
+
+# # offline eval (baseline + control)
+# nohup python src/eval_from_folders.py --root eval_10k --compare-baseline --batch-size 64 --use-is --is-splits 10  > eval_10k/eval_log.out 2>&1 &
+
+
+
+# python src/sample_easycontrol.py \
+#   --config /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-train_easycontrol.yaml \
+#   --data-path /path/to/val \
+#   --canny-path /home/bjia-25/workspace/papers/RAE/code/rae_project/transformer-imagenet-ctrl/out_ctrl/g_canny.png \
+#   --class-label 207 \
+#   --adapter-ckpt /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/ckpts/easycontrol/easycontrol_full/checkpoints/adapter_step-0110000.pt \
+#   --num-samples 4 \
+#   --control-scale 3.2 \
+#   --canny-noise-std 0.05 \
+#   --outdir /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/ckpts/out \
+#   --save-individual
+
+
+
+# python src/sample_easycontrol_avg.py \
+#   --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-train_easycontrol.yaml \
+#   --data-path /home/bjia-25/workspace/papers/RAE/datasets/imagenet/val \
+#   --outdir ckpts/easycontrol/feature_only_run \
+#   --target-class-id 207 \
+#   --image-size 256 \
+#   --precision bf16 \
+#   --adapter-ckpt ckpts/easycontrol/easycontrol_full/checkpoints/adapter_step-0070000.pt \
+#   --num-samples 16 \
+#   --seed 42 \
+#   --steps 50 \
+#   --sampler heun \
+#   --control-scale 3.0 \
+#   --repa-lambda 0.8 \
+#   --repa-loss cosine \
+#   --guidance-low 0.0 \
+#   --guidance-high 0.7 \
+#   --avgfeat-only \
+#   --save-individual

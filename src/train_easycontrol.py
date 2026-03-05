@@ -107,6 +107,25 @@ def save_adapter_checkpoint(
     )
 
 
+def revive_dead_qkv_paths(adapter: nn.Module, std: float = 1e-4) -> List[str]:
+    """
+    Some old checkpoints may contain fully-zero qkv control paths.
+    Re-initialize tiny non-zero weights so gradients can flow again.
+    """
+    revived: List[str] = []
+    if std <= 0.0:
+        return revived
+    with torch.no_grad():
+        for i, blk in enumerate(getattr(adapter, "decoder_blocks", [])):
+            if int(torch.count_nonzero(blk.qkv_out.weight).item()) == 0:
+                nn.init.normal_(blk.qkv_out.weight, mean=0.0, std=std)
+                revived.append(f"decoder_blocks.{i}.qkv_out.weight")
+            if int(torch.count_nonzero(blk.qkv_lora.lora_B).item()) == 0:
+                nn.init.normal_(blk.qkv_lora.lora_B, mean=0.0, std=std)
+                revived.append(f"decoder_blocks.{i}.qkv_lora.lora_B")
+    return revived
+
+
 # -----------------------------------------------------------------------------
 # EasyControl Adapter
 # -----------------------------------------------------------------------------
@@ -211,8 +230,10 @@ class DecoderControlBlock(nn.Module):
         self.qkv_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.qkv_lora = LoRALinear(hidden_dim, 3 * hidden_dim, lora_rank, lora_alpha)
         self.qkv_out = nn.Linear(3 * hidden_dim, 3 * hidden_dim)
-        nn.init.zeros_(self.qkv_out.weight)
+        # Keep this branch near-zero but not exactly zero, otherwise gradients can die.
+        nn.init.normal_(self.qkv_out.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.qkv_out.bias)
+        nn.init.normal_(self.qkv_lora.lora_B, mean=0.0, std=1e-4)
 
         self.post_lora = LoRALinear(hidden_dim, hidden_dim, lora_rank, lora_alpha)
         self.post_mlp = nn.Sequential(
@@ -263,8 +284,11 @@ class EasyControlAdapterFullInjection(nn.Module):
         lora_alpha: float = 16.0,
         qkv_scale: float = 0.05,
         control_clamp: float = 5.0,
+        final_residual_scale: float = 1.0,
         encoder_layer_decay: float = 0.98,
         decoder_layer_decay: float = 0.95,
+        encoder_residual_norm: str = "layernorm",
+        encoder_norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.num_encoder_blocks = int(num_encoder_blocks)
@@ -272,6 +296,14 @@ class EasyControlAdapterFullInjection(nn.Module):
         self.encoder_hidden_dim = int(encoder_hidden_dim)
         self.decoder_hidden_dim = int(decoder_hidden_dim)
         self.control_clamp = float(control_clamp)
+        self.final_residual_scale = float(final_residual_scale)
+        self.encoder_residual_norm = str(encoder_residual_norm).strip().lower()
+        self.encoder_norm_eps = float(encoder_norm_eps)
+        if self.encoder_residual_norm not in {"none", "layernorm", "rmsnorm"}:
+            raise ValueError(
+                f"Unsupported encoder_residual_norm={encoder_residual_norm}. "
+                "Choose from: none, layernorm, rmsnorm."
+            )
 
         self.condition_encoder = ConditionEncoder(
             in_channels=condition_channels,
@@ -325,6 +357,15 @@ class EasyControlAdapterFullInjection(nn.Module):
             return x
         return torch.clamp(x, -self.control_clamp, self.control_clamp)
 
+    def _normalize_encoder_residual(self, x: torch.Tensor) -> torch.Tensor:
+        if self.encoder_residual_norm == "none":
+            return x
+        if self.encoder_residual_norm == "layernorm":
+            return nn.functional.layer_norm(x, (x.shape[-1],), eps=self.encoder_norm_eps)
+        # rmsnorm without affine params to keep adapter checkpoints backward-compatible.
+        denom = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.encoder_norm_eps)
+        return x * denom
+
     def encode_condition(self, condition_image: torch.Tensor) -> torch.Tensor:
         return self.condition_encoder(condition_image)
 
@@ -366,7 +407,8 @@ class EasyControlAdapterFullInjection(nn.Module):
         encoder_post: List[torch.Tensor] = []
         for i, blk in enumerate(self.encoder_blocks):
             scale = self.encoder_layer_scales[i] * control_scale
-            encoder_post.append(self._clamp_residual(blk(enc_feat) * scale))
+            enc_res = self._normalize_encoder_residual(blk(enc_feat))
+            encoder_post.append(self._clamp_residual(enc_res * scale))
 
         decoder_pre: List[torch.Tensor] = []
         decoder_qkv: List[torch.Tensor] = []
@@ -380,7 +422,9 @@ class EasyControlAdapterFullInjection(nn.Module):
             decoder_post.append(self._clamp_residual(post * scale))
             decoder_mlp.append(self._clamp_residual(mlp * scale))
 
-        final = self._clamp_residual(self.final_mlp(self.final_lora(dec_feat)) * control_scale)
+        final = self._clamp_residual(
+            self.final_mlp(self.final_lora(dec_feat)) * control_scale * self.final_residual_scale
+        )
 
         return {
             "encoder_post": encoder_post,
@@ -406,7 +450,7 @@ class EasyControlDiTWrapper(nn.Module):
         self,
         base_model: Stage2ModelProtocol,
         adapter: EasyControlAdapterFullInjection,
-        encoder_warmup_steps: int = 2000,
+        encoder_warmup_steps: int = 0,
     ):
         super().__init__()
         self.base = base_model
@@ -481,7 +525,8 @@ class EasyControlDiTWrapper(nn.Module):
         )
 
         # Encoder warm-up: ramp encoder control from 0 -> 1 for first N steps.
-        if self.encoder_warmup_steps > 0 and global_step is not None:
+        # Only apply during training when an integer global_step is provided.
+        if self.encoder_warmup_steps > 0 and isinstance(global_step, int):
             encoder_multiplier = max(0.0, min(1.0, float(global_step) / float(self.encoder_warmup_steps)))
             if encoder_multiplier < 1.0:
                 payload["encoder_post"] = [r * encoder_multiplier for r in payload["encoder_post"]]
@@ -531,11 +576,34 @@ class EasyControlDiTWrapper(nn.Module):
                 **kwargs,
             )
 
-        control_payload = self._build_control_payload(
-            condition_image,
+        batch = int(x.shape[0])
+        if batch % 2 != 0:
+            raise ValueError(f"CFG expects even batch size, got {batch}")
+        half = batch // 2
+
+        # Use only conditional images to build control, then force uncond control to zero.
+        if int(condition_image.shape[0]) == batch:
+            cond_image = condition_image[:half]
+        elif int(condition_image.shape[0]) == half:
+            cond_image = condition_image
+        else:
+            raise ValueError(
+                f"condition_image batch {int(condition_image.shape[0])} must be either {half} (cond-only) or {batch} (cfg-paired)"
+            )
+
+        cond_payload = self._build_control_payload(
+            cond_image,
             float(control_scale),
             global_step=global_step,
         )
+        control_payload: List[torch.Tensor] = []
+        for i, res in enumerate(cond_payload):
+            if int(res.shape[0]) != half:
+                raise ValueError(
+                    f"control_payload[{i}] batch {int(res.shape[0])} must match conditional half-batch {half}"
+                )
+            control_payload.append(torch.cat([res, torch.zeros_like(res)], dim=0))
+
         return self.base.forward_with_cfg(
             x,
             t,
@@ -668,6 +736,7 @@ def main() -> None:
     sample_every = int(cfg_get(training, "sample_every", 1000))
     save_every = int(cfg_get(training, "save_every", 5000))
     batch_size = int(cfg_get(training, "batch_size", 4))
+    accum_steps = max(1, int(cfg_get(training, "accum_steps", 1)))
     num_workers = int(cfg_get(training, "num_workers", 8))
     label_drop_rate = float(cfg_get(training, "label_drop_rate", 0.1))
     edge_dropout = float(cfg_get(training, "edge_dropout", 0.1))
@@ -676,10 +745,30 @@ def main() -> None:
     control_scale_train_max = float(
         cfg_get(training, "control_scale_train_max", cfg_get(training, "control_scale_train", 2.0))
     )
+    control_scale_train_min = float(cfg_get(training, "control_scale_train_min", 0.0))
+    if control_scale_train_min < 0.0:
+        control_scale_train_min = 0.0
+    if control_scale_train_min > control_scale_train_max:
+        control_scale_train_min = control_scale_train_max
     randomize_control_scale_train = bool(cfg_get(training, "randomize_control_scale_train", True))
-    control_scale_sample = float(cfg_get(training, "control_scale_sample", 3.0))
+    control_scale_sample_raw = float(cfg_get(training, "control_scale_sample", control_scale_train_max))
+    align_control_scale_sample_to_train_max = bool(cfg_get(training, "align_control_scale_sample_to_train_max", True))
+    control_scale_sample = (
+        control_scale_train_max if align_control_scale_sample_to_train_max else control_scale_sample_raw
+    )
     control_scale_warmup_steps = int(cfg_get(training, "control_scale_warmup_steps", 5000))
     control_scale_warmup_factor = float(cfg_get(training, "control_scale_warmup_factor", 0.5))
+    warmup_mode = str(cfg_get(training, "warmup_mode", "scale_only")).strip().lower()
+    if warmup_mode not in {"scale_only", "encoder_only", "both", "none"}:
+        raise ValueError(
+            f"Invalid training.warmup_mode={warmup_mode}. "
+            "Expected one of: scale_only, encoder_only, both, none."
+        )
+    encoder_warmup_steps_cfg = int(cfg_get(training, "encoder_warmup_steps", 2000))
+    enable_control_scale_warmup = warmup_mode in {"scale_only", "both"}
+    encoder_warmup_steps = encoder_warmup_steps_cfg if warmup_mode in {"encoder_only", "both"} else 0
+    revive_dead_qkv_on_resume = bool(cfg_get(training, "revive_dead_qkv_on_resume", True))
+    revive_dead_qkv_std = float(cfg_get(training, "revive_dead_qkv_std", 1e-4))
 
     cfg_scale = float(cfg_get(training, "cfg_scale", 1.5))
     cfg_interval = (
@@ -716,6 +805,15 @@ def main() -> None:
 
     if ilsvrc_class_index:
         logger.info(f"Using class index mapping: {ilsvrc_class_index}")
+    if align_control_scale_sample_to_train_max and abs(control_scale_sample_raw - control_scale_train_max) > 1e-6:
+        logger.warning(
+            "Aligning control_scale_sample to control_scale_train_max: "
+            f"{control_scale_sample_raw:.3f} -> {control_scale_train_max:.3f}"
+        )
+    logger.info(
+        f"Warmup mode={warmup_mode}, control_scale_warmup={'on' if enable_control_scale_warmup else 'off'}, "
+        f"encoder_warmup_steps={encoder_warmup_steps}"
+    )
 
     idx2name = None
     if ilsvrc_class_index and os.path.exists(ilsvrc_class_index):
@@ -755,17 +853,23 @@ def main() -> None:
         lora_alpha=float(cfg_get(training, "lora_alpha", 16.0)),
         qkv_scale=float(cfg_get(training, "qkv_scale", 0.05)),
         control_clamp=float(cfg_get(training, "control_clamp", 5.0)),
+        final_residual_scale=float(cfg_get(training, "final_residual_scale", 1.0)),
         encoder_layer_decay=float(cfg_get(training, "encoder_layer_decay", 0.98)),
         decoder_layer_decay=float(cfg_get(training, "decoder_layer_decay", 0.95)),
+        encoder_residual_norm=str(cfg_get(training, "encoder_residual_norm", "layernorm")),
+        encoder_norm_eps=float(cfg_get(training, "encoder_norm_eps", 1e-6)),
     ).to(device)
 
     adapter_params = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
     logger.info(f"Adapter params: {adapter_params / 1e6:.2f}M")
+    logger.info(
+        f"Encoder residual norm={adapter.encoder_residual_norm}, encoder_norm_eps={adapter.encoder_norm_eps:g}"
+    )
 
     model = EasyControlDiTWrapper(
         base_model,
         adapter,
-        encoder_warmup_steps=int(cfg_get(training, "encoder_warmup_steps", 2000)),
+        encoder_warmup_steps=encoder_warmup_steps,
     ).to(device)
     model.train()
     model.base.eval()
@@ -891,7 +995,8 @@ def main() -> None:
             z_cfg = torch.cat([z, z], dim=0)
             y_null = torch.full((n_vis,), null_label, device=device, dtype=y_cond.dtype)
             y_cfg = torch.cat([y_cond, y_null], dim=0)
-            edge_cfg = torch.cat([edge_cond, edge_cond], dim=0)
+            edge_null = torch.zeros_like(edge_cond)
+            edge_cfg = torch.cat([edge_cond, edge_null], dim=0)
 
             lat_ctrl = eval_sampler(
                 z_cfg,
@@ -949,8 +1054,8 @@ def main() -> None:
 
         edge_a_vis = edge_a.detach().cpu().clamp(0, 1)
         edge_b_vis = edge_b.detach().cpu().clamp(0, 1)
-        edge_a_cfg = torch.cat([edge_a_cond, edge_a_cond], dim=0)
-        edge_b_cfg = torch.cat([edge_b_cond, edge_b_cond], dim=0)
+        edge_a_cfg = torch.cat([edge_a_cond, torch.zeros_like(edge_a_cond)], dim=0)
+        edge_b_cfg = torch.cat([edge_b_cond, torch.zeros_like(edge_b_cond)], dim=0)
 
         with torch.no_grad(), autocast(**autocast_kwargs):
             lat_a = eval_sampler(
@@ -1014,20 +1119,31 @@ def main() -> None:
     start_epoch = 0
     if args.resume:
         logger.info(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location="cpu")
         adapter.load_state_dict(ckpt["adapter"])
+        if revive_dead_qkv_on_resume:
+            revived_keys = revive_dead_qkv_paths(adapter, std=revive_dead_qkv_std)
+            if revived_keys:
+                logger.warning(
+                    f"Revived {len(revived_keys)} dead qkv tensors after resume "
+                    f"(std={revive_dead_qkv_std:g}); this checkpoint needs continued training."
+                )
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = int(ckpt.get("step", 0))
         start_epoch = int(ckpt.get("epoch", 0))
 
     logger.info("Starting EasyControl training")
     logger.info(
-        f"max_steps={max_steps}, batch_size={batch_size}, control_scale_train_max={control_scale_train_max}, "
-        f"control_scale_sample={control_scale_sample}, cfg_scale={cfg_scale}, cfg_interval={cfg_interval}"
+        f"max_steps={max_steps}, batch_size={batch_size}, accum_steps={accum_steps}, "
+        f"effective_batch={batch_size * accum_steps}, control_scale_train=[{control_scale_train_min}, {control_scale_train_max}], "
+        f"control_scale_sample={control_scale_sample}, cfg_scale={cfg_scale}, cfg_interval={cfg_interval}, "
+        f"warmup_mode={warmup_mode}"
     )
 
     global_step = start_step
     running_loss = 0.0
+    accum_counter = 0
+    optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, 10000):
         for images, labels, edges in loader:
@@ -1056,13 +1172,14 @@ def main() -> None:
                 z = rae.encode(images)
 
             if randomize_control_scale_train:
-                control_scale_train = float(torch.empty(1, device=device).uniform_(0.0, control_scale_train_max).item())
+                control_scale_train = float(
+                    torch.empty(1, device=device).uniform_(control_scale_train_min, control_scale_train_max).item()
+                )
             else:
                 control_scale_train = control_scale_train_max
-            if global_step < control_scale_warmup_steps:
+            if enable_control_scale_warmup and control_scale_warmup_steps > 0 and global_step < control_scale_warmup_steps:
                 control_scale_train = control_scale_train * control_scale_warmup_factor
 
-            optimizer.zero_grad(set_to_none=True)
             with autocast(**autocast_kwargs):
                 loss = transport.training_losses(
                     model,
@@ -1076,13 +1193,21 @@ def main() -> None:
                 )["loss"].mean()
 
             loss_f = loss.float()
+            loss_bwd = loss_f / float(accum_steps)
             if scaler is not None and scaler.is_enabled():
-                scaler.scale(loss_f).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss_bwd).backward()
             else:
-                loss_f.backward()
-                optimizer.step()
+                loss_bwd.backward()
+
+            accum_counter += 1
+            if accum_counter >= accum_steps:
+                if scaler is not None and scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
 
             running_loss += float(loss_f.item())
             global_step += 1
@@ -1100,15 +1225,30 @@ def main() -> None:
 
             if global_step % save_every == 0:
                 ckpt_path = os.path.join(checkpoint_dir, f"adapter_step-{global_step:07d}.pt")
-                save_adapter_checkpoint(ckpt_path, global_step, epoch, adapter, optimizer)
-                logger.info(f"Saved checkpoint: {ckpt_path}")
+                try:
+                    save_adapter_checkpoint(ckpt_path, global_step, epoch, adapter, optimizer)
+                    logger.info(f"Saved checkpoint: {ckpt_path}")
+                except Exception as exc:
+                    logger.warning(f"Checkpoint save failed at step {global_step}: {exc}")
+
+        if global_step >= max_steps and accum_counter > 0:
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            accum_counter = 0
 
         if global_step >= max_steps:
             break
 
     final_path = os.path.join(checkpoint_dir, f"adapter_final_step-{global_step:07d}.pt")
-    save_adapter_checkpoint(final_path, global_step, epoch, adapter, optimizer)
-    logger.info(f"Training complete. Final checkpoint: {final_path}")
+    try:
+        save_adapter_checkpoint(final_path, global_step, epoch, adapter, optimizer)
+        logger.info(f"Training complete. Final checkpoint: {final_path}")
+    except Exception as exc:
+        logger.warning(f"Training complete, but final checkpoint save failed: {exc}")
 
 
 if __name__ == "__main__":

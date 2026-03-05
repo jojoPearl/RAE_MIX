@@ -84,19 +84,21 @@ training:
   checkpoint_interval: 10000
 
   # -------- data dropout --------
-  edge_dropout: 0.08
+  edge_dropout: 0.05
   label_drop_rate: 0.1
 
   ilsvrc_class_index: /home/bjia-25/workspace/papers/RAE/code/rae_project/RAE_MIX/assets/imagenet_class_index.json
 
   # -------- control strength --------
   # stage2: randomize U(0, control_scale_train_max)
+  control_scale_train_min: 0.4
   control_scale_train_max: 2.4
   control_scale_train: 2.4
   randomize_control_scale_train: true
 
   # sample: stronger for clearer control visibility
-  control_scale_sample: 3.2
+  control_scale_sample: 2.4
+  align_control_scale_sample_to_train_max: true
   ablation_control_scale: 8.0
 
   # -------- CFG --------
@@ -111,11 +113,15 @@ training:
   lora_alpha: 16.0
   qkv_scale: 0.022
   control_clamp: 4.0
+  final_residual_scale: 0.35
+  encoder_residual_norm: layernorm
+  encoder_norm_eps: 1.0e-6
   encoder_layer_decay: 0.98
   decoder_layer_decay: 0.95
   encoder_warmup_steps: 2500
   control_scale_warmup_steps: 6000
   control_scale_warmup_factor: 0.6
+  warmup_mode: scale_only
 
   # -------- optimizer --------
   lr: 8.0e-5
